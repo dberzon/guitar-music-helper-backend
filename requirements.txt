@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+basic-pitch==0.2.5
+librosa==0.10.1
+numpy==1.23.5
+scipy==1.11.4
+pydantic==2.5.0
+python-dotenv==1.0.0
