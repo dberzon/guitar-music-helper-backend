@@ -24,27 +24,61 @@ app = FastAPI(
 )
 
 # Configure CORS
-cors_origins = [
-    "http://localhost:3000", 
-    "http://localhost:5173", 
-    "http://localhost:5174"
-]
+def is_allowed_origin(origin: str) -> bool:
+    """Check if origin is allowed based on patterns."""
+    if not origin:
+        return False
+    
+    # Development origins
+    allowed_patterns = [
+        "http://localhost:3000",
+        "http://localhost:5173", 
+        "http://localhost:5174"
+    ]
+    
+    # Production patterns
+    if os.environ.get("RAILWAY_ENVIRONMENT") == "production":
+        # Check for Vercel subdomains
+        if origin.endswith(".vercel.app") and origin.startswith("https://"):
+            return True
+        # Check for Netlify subdomains  
+        if origin.endswith(".netlify.app") and origin.startswith("https://"):
+            return True
+        # Add specific known domains
+        allowed_patterns.extend([
+            "https://guitar-music-helper.vercel.app",
+            "https://guitar-music-helper-git-main.vercel.app"
+        ])
+    
+    return origin in allowed_patterns
 
-# Add production origins if in production
-if os.environ.get("RAILWAY_ENVIRONMENT") == "production":
-    cors_origins.extend([
-        "https://*.vercel.app",
-        "https://*.netlify.app",
-        "*"  # Allow all origins in production for now
-    ])
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def cors_middleware(request, call_next):
+    """Custom CORS middleware with subdomain support."""
+    origin = request.headers.get("origin")
+    
+    response = await call_next(request)
+    
+    if is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    # Handle preflight requests
+    if request.method == "OPTIONS" and is_allowed_origin(origin):
+        from fastapi.responses import Response
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
+    
+    return response
 # Initialize basic-pitch model
 model_path = ICASSP_2022_MODEL_PATH
 
