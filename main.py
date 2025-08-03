@@ -80,16 +80,20 @@ app = FastAPI(
 )
 
 # --- CORS Middleware Configuration ---
+# Always include production Vercel URLs to ensure they work regardless of environment detection
+base_allowed_origins = [
+    "https://guitar-music-helper.vercel.app",
+    "https://guitar-music-helper-hq7lavby6-dberzons-projects.vercel.app",
+    "https://guitar-music-helper-4b20ml8tu-dberzons-projects.vercel.app",
+]
+
 if config.ENVIRONMENT == "production":
-    allowed_origins = [
-        "https://guitar-music-helper.vercel.app",
-        "https://guitar-music-helper-hq7lavby6-dberzons-projects.vercel.app",
-    ]
+    allowed_origins = base_allowed_origins
     allow_origin_regex = r"https://guitar-music-helper-.*\.vercel\.app$"
     allow_credentials = True
     logger.info(f"CORS configured for PRODUCTION.")
 else:
-    allowed_origins = [
+    allowed_origins = base_allowed_origins + [
         "http://localhost:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5173",
