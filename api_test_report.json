@@ -1,43 +1,277 @@
 {
   "summary": {
     "total_tests": 5,
-    "passed": 0,
-    "failed": 5
+    "passed": 5,
+    "failed": 0
   },
   "results": [
     {
       "endpoint": "/",
       "method": "GET",
-      "success": false,
-      "error": "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: / (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x000002B8B89C1E70>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))",
+      "success": true,
+      "status_code": 200,
+      "headers": {
+        "date": "Sun, 03 Aug 2025 12:18:19 GMT",
+        "server": "uvicorn",
+        "content-length": "94",
+        "content-type": "application/json"
+      },
+      "data": {
+        "service": "Guitar Music Helper Audio Transcription API",
+        "version": "1.0.0",
+        "status": "healthy"
+      },
       "url": "http://localhost:8000/"
     },
     {
       "endpoint": "/health",
       "method": "GET",
-      "success": false,
-      "error": "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /health (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x000002B8B89C22C0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))",
+      "success": true,
+      "status_code": 200,
+      "headers": {
+        "date": "Sun, 03 Aug 2025 12:18:19 GMT",
+        "server": "uvicorn",
+        "content-length": "178",
+        "content-type": "application/json"
+      },
+      "data": {
+        "status": "healthy",
+        "dependencies_loaded": true,
+        "models_loaded": true,
+        "supported_formats": [
+          ".mp3",
+          ".ogg",
+          ".flac",
+          ".m4a",
+          ".wav"
+        ],
+        "max_file_size_mb": 50,
+        "timestamp": 1754223499.665884
+      },
       "url": "http://localhost:8000/health"
     },
     {
       "endpoint": "/supported-formats",
       "method": "GET",
-      "success": false,
-      "error": "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /supported-formats (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x000002B8B89C26B0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))",
+      "success": true,
+      "status_code": 200,
+      "headers": {
+        "date": "Sun, 03 Aug 2025 12:18:19 GMT",
+        "server": "uvicorn",
+        "content-length": "77",
+        "content-type": "application/json"
+      },
+      "data": {
+        "supportedFormats": [
+          ".mp3",
+          ".ogg",
+          ".flac",
+          ".m4a",
+          ".wav"
+        ],
+        "maxFileSizeMb": 50
+      },
       "url": "http://localhost:8000/supported-formats"
     },
     {
       "endpoint": "/docs",
       "method": "GET",
-      "success": false,
-      "error": "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /docs (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x000002B8B89C2A10>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))",
+      "success": true,
+      "status_code": 200,
+      "headers": {
+        "date": "Sun, 03 Aug 2025 12:18:19 GMT",
+        "server": "uvicorn",
+        "content-length": "977",
+        "content-type": "text/html; charset=utf-8"
+      },
+      "data": "\n    <!DOCTYPE html>\n    <html>\n    <head>\n    <link type=\"text/css\" rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui.css\">\n    <link rel=\"shortcut icon\" href=\"https://fastapi.tiangolo.com/img/favicon.png\">\n    <title>Guitar Music Helper - Audio Transcription API - Swagger UI</title>\n    </head>\n    <body>\n    <div id=\"swagger-ui\">\n    </div>\n    <script src=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui-bundle.js\"></script>\n    <!-- `SwaggerUIBundle` is now available on the page -->\n    <script>\n    const ui = SwaggerUIBundle({\n        url: '/openapi.json',\n    \"dom_id\": \"#swagger-ui\",\n\"layout\": \"BaseLayout\",\n\"deepLinking\": true,\n\"showExtensions\": true,\n\"showCommonExtensions\": true,\noauth2RedirectUrl: window.location.origin + '/docs/oauth2-redirect',\n    presets: [\n        SwaggerUIBundle.presets.apis,\n        SwaggerUIBundle.SwaggerUIStandalonePreset\n        ],\n    })\n    </script>\n    </body>\n    </html>\n    ",
       "url": "http://localhost:8000/docs"
     },
     {
       "endpoint": "/openapi.json",
       "method": "GET",
-      "success": false,
-      "error": "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded with url: /openapi.json (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x000002B8B89C2DD0>: Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it'))",
+      "success": true,
+      "status_code": 200,
+      "headers": {
+        "date": "Sun, 03 Aug 2025 12:18:19 GMT",
+        "server": "uvicorn",
+        "content-length": "2407",
+        "content-type": "application/json"
+      },
+      "data": {
+        "openapi": "3.1.0",
+        "info": {
+          "title": "Guitar Music Helper - Audio Transcription API",
+          "description": "An API to transcribe guitar audio into notes and chords using basic-pitch.",
+          "version": "1.0.0"
+        },
+        "paths": {
+          "/": {
+            "get": {
+              "tags": [
+                "Status"
+              ],
+              "summary": "API Root",
+              "description": "Provides basic service information and status.",
+              "operationId": "root__get",
+              "responses": {
+                "200": {
+                  "description": "Successful Response",
+                  "content": {
+                    "application/json": {
+                      "schema": {}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "/health": {
+            "get": {
+              "tags": [
+                "Status"
+              ],
+              "summary": "Health Check",
+              "description": "Performs a detailed health check of the service and its dependencies.",
+              "operationId": "health_check_health_get",
+              "responses": {
+                "200": {
+                  "description": "Successful Response",
+                  "content": {
+                    "application/json": {
+                      "schema": {}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "/transcribe": {
+            "post": {
+              "tags": [
+                "Transcription"
+              ],
+              "summary": "Transcribe Audio File",
+              "description": "Accepts an audio file, transcribes it to find chords and melody,\nand returns the structured data.",
+              "operationId": "transcribe_audio_transcribe_post",
+              "requestBody": {
+                "content": {
+                  "multipart/form-data": {
+                    "schema": {
+                      "$ref": "#/components/schemas/Body_transcribe_audio_transcribe_post"
+                    }
+                  }
+                },
+                "required": true
+              },
+              "responses": {
+                "200": {
+                  "description": "Successful Response",
+                  "content": {
+                    "application/json": {
+                      "schema": {}
+                    }
+                  }
+                },
+                "422": {
+                  "description": "Validation Error",
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "$ref": "#/components/schemas/HTTPValidationError"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "/supported-formats": {
+            "get": {
+              "tags": [
+                "Status"
+              ],
+              "summary": "Get Supported Formats",
+              "description": "Returns the list of supported audio formats and file size limits.",
+              "operationId": "get_supported_formats_supported_formats_get",
+              "responses": {
+                "200": {
+                  "description": "Successful Response",
+                  "content": {
+                    "application/json": {
+                      "schema": {}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "components": {
+          "schemas": {
+            "Body_transcribe_audio_transcribe_post": {
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "format": "binary",
+                  "title": "File"
+                }
+              },
+              "type": "object",
+              "required": [
+                "file"
+              ],
+              "title": "Body_transcribe_audio_transcribe_post"
+            },
+            "HTTPValidationError": {
+              "properties": {
+                "detail": {
+                  "items": {
+                    "$ref": "#/components/schemas/ValidationError"
+                  },
+                  "type": "array",
+                  "title": "Detail"
+                }
+              },
+              "type": "object",
+              "title": "HTTPValidationError"
+            },
+            "ValidationError": {
+              "properties": {
+                "loc": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "type": "array",
+                  "title": "Location"
+                },
+                "msg": {
+                  "type": "string",
+                  "title": "Message"
+                },
+                "type": {
+                  "type": "string",
+                  "title": "Error Type"
+                }
+              },
+              "type": "object",
+              "required": [
+                "loc",
+                "msg",
+                "type"
+              ],
+              "title": "ValidationError"
+            }
+          }
+        }
+      },
       "url": "http://localhost:8000/openapi.json"
     }
   ]

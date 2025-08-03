@@ -323,9 +323,7 @@ async def get_supported_formats():
     logger.info(f"Returning supported formats: {formats}")
     return {
         "supportedFormats": formats,
-        "maxFileSizeMb": config.MAX_FILE_SIZE_MB,
-        "supported_formats": formats,
-        "max_file_size_mb": config.MAX_FILE_SIZE_MB,
+        "maxFileSizeMb": config.MAX_FILE_SIZE_MB
     }
 
 
