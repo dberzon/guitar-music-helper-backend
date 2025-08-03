@@ -93,23 +93,18 @@ if config.ENVIRONMENT == "production":
     allow_credentials = True
     logger.info(f"CORS configured for PRODUCTION.")
 else:
-    allowed_origins = base_allowed_origins + [
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "*"
-    ] # Allow frontend dev server and permissive for local development
+    # More permissive CORS for development - allow all origins
+    allowed_origins = ["*"]  # Allow all origins for development
     allow_origin_regex = None
-    allow_credentials = True
-    logger.info(f"CORS configured for DEVELOPMENT with frontend dev server support.")
+    allow_credentials = False  # Must be False when allow_origins=["*"]
+    logger.info(f"CORS configured for DEVELOPMENT with permissive settings.")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_origin_regex=allow_origin_regex,
     allow_credentials=allow_credentials,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
