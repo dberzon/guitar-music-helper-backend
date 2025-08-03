@@ -22,11 +22,12 @@ from slowapi.errors import RateLimitExceeded
 # --- Configure Logging ---
 # Initialize config first to get LOG_LEVEL
 class Config(BaseSettings):
-    MAX_FILE_SIZE_MB: int = Field(50, description="Max file size in MB")
+    MAX_FILE_SIZE_MB: int = Field(10, description="Max file size in MB - reduced for Railway memory limits")
     ALLOWED_EXTENSIONS: set[str] = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
-    MAX_WORKERS: int = 2
+    MAX_WORKERS: int = 1  # Reduced to prevent memory exhaustion
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
     LOG_LEVEL: str = "INFO"
+    PROCESSING_TIMEOUT: int = Field(30, description="Max processing time in seconds")
 
     @property
     def MAX_FILE_SIZE(self):
@@ -341,12 +342,19 @@ async def transcribe_audio(request: Request, file: UploadFile = Depends(validate
         
         logger.info(f"File '{file.filename}' saved to temp path: {tmp_path} using chunked streaming")
         
-        # Run the blocking, CPU-intensive function in the thread pool
+        # Run the blocking, CPU-intensive function in the thread pool with timeout
         executor = request.app.state.executor
         loop = asyncio.get_event_loop()
-        processing_result_dict = await loop.run_in_executor(
-            executor, process_audio_file_sync, tmp_path
-        )
+        
+        # Add timeout to prevent Railway from timing out
+        try:
+            processing_result_dict = await asyncio.wait_for(
+                loop.run_in_executor(executor, process_audio_file_sync, tmp_path),
+                timeout=config.PROCESSING_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
+            raise AudioProcessingError(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds. Try uploading a smaller file.")
         
         processing_time = time.time() - start_time
         logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s")
