@@ -24,61 +24,27 @@ app = FastAPI(
 )
 
 # Configure CORS
-def is_allowed_origin(origin: str) -> bool:
-    """Check if origin is allowed based on patterns."""
-    if not origin:
-        return False
-    
-    # Development origins
-    allowed_patterns = [
-        "http://localhost:3000",
-        "http://localhost:5173", 
-        "http://localhost:5174"
-    ]
-    
-    # Production patterns
-    if os.environ.get("RAILWAY_ENVIRONMENT") == "production":
-        # Check for Vercel subdomains
-        if origin.endswith(".vercel.app") and origin.startswith("https://"):
-            return True
-        # Check for Netlify subdomains  
-        if origin.endswith(".netlify.app") and origin.startswith("https://"):
-            return True
-        # Add specific known domains
-        allowed_patterns.extend([
-            "https://guitar-music-helper.vercel.app",
-            "https://guitar-music-helper-git-main.vercel.app"
-        ])
-    
-    return origin in allowed_patterns
+allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173", 
+    "http://localhost:5174",
+]
 
-@app.middleware("http")
-async def cors_middleware(request, call_next):
-    """Custom CORS middleware with subdomain support."""
-    origin = request.headers.get("origin")
-    
-    response = await call_next(request)
-    
-    if is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-    
-    # Handle preflight requests
-    if request.method == "OPTIONS" and is_allowed_origin(origin):
-        from fastapi.responses import Response
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Credentials": "true",
-                "Access-Control-Allow-Methods": "*",
-                "Access-Control-Allow-Headers": "*",
-            }
-        )
-    
-    return response
+# Production origins
+if os.environ.get("RAILWAY_ENVIRONMENT") == "production":
+    allowed_origins.extend([
+        "https://guitar-music-helper.vercel.app",
+        "https://guitar-music-helper-git-main.vercel.app",
+    ])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app$|https://.*\.netlify\.app$",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 # Initialize basic-pitch model
 model_path = ICASSP_2022_MODEL_PATH
 
@@ -93,6 +59,11 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "model_loaded": True}
+
+@app.get("/cors-test")
+async def cors_test():
+    """Simple endpoint to test CORS configuration."""
+    return {"message": "CORS is working", "timestamp": time.time()}
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -164,9 +135,17 @@ async def transcribe_audio(file: UploadFile = File(...)):
             
         finally:
             # Clean up temporary file
-            os.unlink(tmp_path)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
+        # Log the error for debugging
+        print(f"Transcription error: {str(e)}")
+        print(f"Error type: {type(e).__name__}")
+        
         return TranscriptionResponse(
             success=False,
             error={
