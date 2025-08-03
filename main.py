@@ -4,9 +4,10 @@ import time
 from typing import List, Optional
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 import uvicorn
 import librosa
 import numpy as np
@@ -23,28 +24,79 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configure CORS
+# Configure CORS - Temporarily more permissive for debugging
 allowed_origins = [
-    "http://localhost:3000",
-    "http://localhost:5173", 
-    "http://localhost:5174",
+    "*",  # Temporarily allow all origins
 ]
 
-# Production origins
-if os.environ.get("RAILWAY_ENVIRONMENT") == "production":
-    allowed_origins.extend([
-        "https://guitar-music-helper.vercel.app",
-        "https://guitar-music-helper-git-main.vercel.app",
-    ])
-
+# Allow all Vercel and Netlify subdomains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app$|https://.*\.netlify\.app$",
-    allow_credentials=True,
+    allow_credentials=False,  # Must be False when using "*"
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Debug middleware to log requests
+@app.middleware("http")
+async def debug_middleware(request: Request, call_next):
+    """Debug middleware to log requests and origins."""
+    origin = request.headers.get("origin", "No origin header")
+    method = request.method
+    url = str(request.url)
+    
+    print(f"Request: {method} {url}")
+    print(f"Origin: {origin}")
+    print(f"Headers: {dict(request.headers)}")
+    
+    response = await call_next(request)
+    
+    print(f"Response status: {response.status_code}")
+    print(f"Response headers: {dict(response.headers)}")
+    
+    return response
+
+# Global exception handler to ensure CORS headers are always present
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle all exceptions and ensure CORS headers are present."""
+    print(f"Global exception: {str(exc)}")
+    print(f"Exception type: {type(exc).__name__}")
+    
+    response = JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "An internal server error occurred",
+                "details": {"type": type(exc).__name__}
+            }
+        }
+    )
+    
+    # Add CORS headers manually for wildcard
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    return response
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions and ensure CORS headers are present."""
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+    
+    # Add CORS headers manually for wildcard
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    
+    return response
 # Initialize basic-pitch model
 model_path = ICASSP_2022_MODEL_PATH
 
