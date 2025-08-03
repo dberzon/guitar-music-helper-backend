@@ -9,14 +9,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 import uvicorn
-import librosa
-import numpy as np
-from basic_pitch import ICASSP_2022_MODEL_PATH
-from basic_pitch.inference import predict
-import scipy.io.wavfile as wavfile
 
-from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
-from transcription_utils import process_basic_pitch_output, convert_to_transcription_format
+# Try to import heavy dependencies with error handling
+try:
+    import librosa
+    import numpy as np
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    from basic_pitch.inference import predict
+    import scipy.io.wavfile as wavfile
+    DEPENDENCIES_LOADED = True
+    print("All ML dependencies loaded successfully")
+except Exception as e:
+    print(f"Warning: Could not load ML dependencies: {e}")
+    DEPENDENCIES_LOADED = False
+    # Set dummy values to prevent import errors
+    ICASSP_2022_MODEL_PATH = None
+
+# Import models and utilities
+try:
+    from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
+    from transcription_utils import process_basic_pitch_output, convert_to_transcription_format
+    MODELS_LOADED = True
+except Exception as e:
+    print(f"Warning: Could not load models: {e}")
+    MODELS_LOADED = False
+    # These will be needed for type hints even if not working
+    TranscriptionResponse = dict
+    TranscriptionResult = dict
+    TranscriptionMetadata = dict
 
 app = FastAPI(
     title="Guitar Music Helper - Audio Transcription API",
@@ -98,7 +118,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     
     return response
 # Initialize basic-pitch model
-model_path = ICASSP_2022_MODEL_PATH
+model_path = ICASSP_2022_MODEL_PATH if DEPENDENCIES_LOADED else None
 
 # Constants
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -106,21 +126,38 @@ ALLOWED_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
 
 @app.get("/")
 async def root():
-    return {"Hello": "World", "service": "Guitar Music Helper Audio Transcription API", "version": "1.0.0"}
+    return {
+        "Hello": "World", 
+        "service": "Guitar Music Helper Audio Transcription API", 
+        "version": "1.0.0",
+        "dependencies_loaded": DEPENDENCIES_LOADED
+    }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "model_loaded": True}
+    return {
+        "status": "healthy", 
+        "model_loaded": DEPENDENCIES_LOADED and MODELS_LOADED,
+        "dependencies_status": "loaded" if DEPENDENCIES_LOADED else "failed_to_load",
+        "models_status": "loaded" if MODELS_LOADED else "failed_to_load"
+    }
 
 @app.get("/cors-test")
 async def cors_test():
     """Simple endpoint to test CORS configuration."""
     return {"message": "CORS is working", "timestamp": time.time()}
 
-@app.post("/transcribe", response_model=TranscriptionResponse)
+@app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
     """Transcribe audio file to chords and melody."""
     start_time = time.time()
+    
+    # Check if dependencies are loaded
+    if not DEPENDENCIES_LOADED or not MODELS_LOADED:
+        raise HTTPException(
+            status_code=503, 
+            detail="Transcription service unavailable - dependencies not loaded"
+        )
     
     try:
         # Validate file
