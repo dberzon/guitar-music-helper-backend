@@ -113,14 +113,14 @@ async def debug_middleware(request: Request, call_next):
     method = request.method
     url = str(request.url)
     
-    print(f"Request: {method} {url}")
-    print(f"Origin: {origin}")
-    print(f"Headers: {dict(request.headers)}")
+    logger.debug(f"Request: {method} {url}")
+    logger.debug(f"Origin: {origin}")
+    logger.debug(f"Headers: {dict(request.headers)}")
     
     response = await call_next(request)
     
-    print(f"Response status: {response.status_code}")
-    print(f"Response headers: {dict(response.headers)}")
+    logger.debug(f"Response status: {response.status_code}")
+    logger.debug(f"Response headers: {dict(response.headers)}")
     
     return response
 
@@ -142,15 +142,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
     
-    # Add CORS headers manually
-    origin = request.headers.get("origin")
-    if origin and (origin in allowed_origins or origin == "*" in allowed_origins):
-        response.headers["Access-Control-Allow-Origin"] = origin if allow_credentials else "*"
-        if allow_credentials:
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-    
     return response
 
 @app.exception_handler(HTTPException)
@@ -162,15 +153,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         content={"detail": exc.detail}
     )
-    
-    # Add CORS headers manually
-    origin = request.headers.get("origin")
-    if origin and (origin in allowed_origins or "*" in allowed_origins):
-        response.headers["Access-Control-Allow-Origin"] = origin if allow_credentials else "*"
-        if allow_credentials:
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
     
     return response
 
@@ -191,15 +173,6 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
         }
     )
     
-    # Add CORS headers
-    origin = request.headers.get("origin")
-    if origin and (origin in allowed_origins or "*" in allowed_origins):
-        response.headers["Access-Control-Allow-Origin"] = origin if allow_credentials else "*"
-        if allow_credentials:
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-    
     return response
 # Initialize basic-pitch model
 model_path = ICASSP_2022_MODEL_PATH if DEPENDENCIES_LOADED else None
@@ -207,8 +180,16 @@ model_path = ICASSP_2022_MODEL_PATH if DEPENDENCIES_LOADED else None
 # Dependency injection helpers
 def get_dependencies_status():
     """Check if all dependencies are available."""
-    if not DEPENDENCIES_LOADED or not MODELS_LOADED:
-        raise DependencyError("Required dependencies not loaded")
+    if not DEPENDENCIES_LOADED:
+        raise HTTPException(
+            status_code=503, 
+            detail="ML dependencies not loaded - transcription service unavailable"
+        )
+    if not MODELS_LOADED:
+        raise HTTPException(
+            status_code=503, 
+            detail="Model dependencies not loaded - transcription service unavailable"
+        )
     return True
 
 def validate_file_size(file_size: int):
@@ -255,6 +236,10 @@ async def cors_test():
 def process_audio_file_sync(tmp_path: str, filename: str, start_time: float):
     """Process audio file synchronously (to be run in thread)."""
     try:
+        # Ensure all required functions are available
+        if not librosa or not predict or not process_basic_pitch_output:
+            raise AudioProcessingError("Required ML dependencies not properly loaded")
+            
         # Load audio
         audio, sr = librosa.load(tmp_path, sr=None, mono=True)
         
@@ -320,7 +305,12 @@ async def transcribe_audio(
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
             tmp_path = tmp_file.name
             content_size = 0
-            async for chunk in file.chunks():
+            chunk_size = 1024 * 1024  # 1MB chunks
+            
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
                 content_size += len(chunk)
                 # Check size incrementally to avoid memory issues
                 if content_size > config.MAX_FILE_SIZE:
@@ -352,14 +342,18 @@ async def transcribe_audio(
         # Log unexpected errors
         logger.error(f"Unexpected transcription error: {str(e)}", exc_info=True)
         
-        return TranscriptionResponse(
-            success=False,
-            error={
-                "code": "TRANSCRIPTION_ERROR",
-                "message": str(e),
-                "details": {"type": type(e).__name__}
-            },
-            processingTime=time.time() - start_time
+        # Return consistent error response format
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "success": False,
+                "error": {
+                    "code": "TRANSCRIPTION_ERROR",
+                    "message": str(e),
+                    "details": {"type": type(e).__name__}
+                },
+                "processingTime": time.time() - start_time
+            }
         )
     finally:
         # Clean up temporary file
