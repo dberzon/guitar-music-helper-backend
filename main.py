@@ -6,30 +6,60 @@ import logging
 from typing import Dict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+import aiofiles
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # --- Configure Logging ---
-# Use INFO level for production, but DEBUG can be useful for development.
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
-logger = logging.getLogger(__name__)
+# Initialize config first to get LOG_LEVEL
+class Config(BaseSettings):
+    MAX_FILE_SIZE_MB: int = Field(50, description="Max file size in MB")
+    ALLOWED_EXTENSIONS: set[str] = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
+    MAX_WORKERS: int = 2
+    ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
+    LOG_LEVEL: str = "INFO"
 
-# --- Application Configuration ---
-class Config:
-    """Loads configuration from environment variables with sensible defaults."""
-    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-    MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
-    ALLOWED_EXTENSIONS = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))  # Keep low for shared/low-resource environments
-    ENVIRONMENT = os.getenv("RAILWAY_ENVIRONMENT", "development")
+    @property
+    def MAX_FILE_SIZE(self):
+        return self.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    class Config:
+        env_file = ".env"
 
 config = Config()
 
+# Initialize rate limiter - limits requests based on client IP address
+limiter = Limiter(key_func=get_remote_address)
+
+# Configure logging using the config LOG_LEVEL
+logging.basicConfig(level=config.LOG_LEVEL.upper())
+logger = logging.getLogger(__name__)
+
+# --- Application Configuration ---
+
+# --- Lifespan Context Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown events."""
+    # Startup
+    app.state.executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+    logger.info(f"ThreadPoolExecutor started with {config.MAX_WORKERS} workers")
+    yield
+    # Shutdown
+    app.state.executor.shutdown(wait=True)
+    logger.info("ThreadPoolExecutor shutdown complete")
+
 # --- Thread Pool for CPU-intensive Tasks ---
-executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+# Note: executor is now managed via lifespan context and accessed via app.state.executor
 
 # --- Custom Exceptions ---
 class AudioProcessingError(Exception):
@@ -77,7 +107,12 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs" if config.ENVIRONMENT == "development" else None,
     redoc_url="/redoc" if config.ENVIRONMENT == "development" else None,
+    lifespan=lifespan,
 )
+
+# Configure rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- CORS Middleware Configuration ---
 # Always include production Vercel URLs to ensure they work regardless of environment detection
@@ -207,6 +242,22 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
             status_code=415,  # Unsupported Media Type
             detail=f"Unsupported file type '{file_extension}'. Allowed types are: {', '.join(config.ALLOWED_EXTENSIONS)}"
         )
+    
+    # Validate MIME type matches the file extension
+    allowed_mime_types = {
+        '.wav': 'audio/wav',
+        '.mp3': 'audio/mpeg',
+        '.m4a': 'audio/x-m4a',
+        '.flac': 'audio/flac',
+        '.ogg': 'audio/ogg'
+    }
+    expected = allowed_mime_types.get(file_extension)
+    if expected and file.content_type != expected:
+        raise HTTPException(
+            status_code=415, 
+            detail=f"MIME type {file.content_type} doesn't match expected {expected} for {file_extension} files"
+        )
+    
     return file
 
 @app.get("/", summary="API Root", tags=["Status"])
@@ -268,7 +319,8 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
     tags=["Transcription"],
     dependencies=[Depends(check_dependencies)], # Protects the endpoint if dependencies are missing
 )
-async def transcribe_audio(file: UploadFile = Depends(validate_file)):
+@limiter.limit("5/minute")
+async def transcribe_audio(request: Request, file: UploadFile = Depends(validate_file)):
     """
     Accepts an audio file, transcribes it to find chords and melody,
     and returns the structured data.
@@ -277,16 +329,20 @@ async def transcribe_audio(file: UploadFile = Depends(validate_file)):
     tmp_path = None
 
     try:
-        # Save uploaded file to a temporary location for processing. This is memory-efficient.
+        # Save uploaded file to a temporary location using chunked streaming for memory efficiency
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp_file:
             tmp_path = tmp_file.name
-            await file.seek(0) # Ensure reading from the start
-            content = await file.read()
-            tmp_file.write(content)
         
-        logger.info(f"File '{file.filename}' saved to temp path: {tmp_path}")
+        # Use chunked streaming to avoid loading large files into memory
+        await file.seek(0)  # Ensure reading from the start
+        async with aiofiles.open(tmp_path, 'wb') as out_file:
+            while content := await file.read(1024 * 1024):  # Read in 1MB chunks
+                await out_file.write(content)
+        
+        logger.info(f"File '{file.filename}' saved to temp path: {tmp_path} using chunked streaming")
         
         # Run the blocking, CPU-intensive function in the thread pool
+        executor = request.app.state.executor
         loop = asyncio.get_event_loop()
         processing_result_dict = await loop.run_in_executor(
             executor, process_audio_file_sync, tmp_path
