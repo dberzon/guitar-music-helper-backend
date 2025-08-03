@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Integration Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .endpoint {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .response {
+            background: #f5f5f5;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 3px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .error {
+            background: #ffe6e6;
+            color: #d00;
+        }
+        .success {
+            background: #e6ffe6;
+            color: #080;
+        }
+    </style>
+</head>
+<body>
+    <h1>API Integration Test</h1>
+    
+    <div class="endpoint">
+        <h3>Test /supported-formats endpoint</h3>
+        <button onclick="testSupportedFormats()">Test</button>
+        <div id="formats-result" class="response"></div>
+    </div>
+    
+    <div class="endpoint">
+        <h3>Test /health endpoint</h3>
+        <button onclick="testHealth()">Test</button>
+        <div id="health-result" class="response"></div>
+    </div>
+    
+    <div class="endpoint">
+        <h3>Test / endpoint</h3>
+        <button onclick="testRoot()">Test</button>
+        <div id="root-result" class="response"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        
+        async function testSupportedFormats() {
+            const resultDiv = document.getElementById('formats-result');
+            try {
+                const response = await fetch(`${API_BASE}/supported-formats`);
+                const data = await response.json();
+                
+                resultDiv.className = 'response success';
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+                
+                // Test the specific property access that was failing
+                if (data.supportedFormats && Array.isArray(data.supportedFormats)) {
+                    const formatsList = data.supportedFormats.map(format => `- ${format}`).join('\n');
+                    resultDiv.textContent += `\n\n✅ supportedFormats.map() works correctly:\n${formatsList}`;
+                } else {
+                    resultDiv.textContent += '\n\n❌ supportedFormats is not an array';
+                }
+                
+            } catch (error) {
+                resultDiv.className = 'response error';
+                resultDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        async function testHealth() {
+            const resultDiv = document.getElementById('health-result');
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                
+                resultDiv.className = 'response success';
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                resultDiv.className = 'response error';
+                resultDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        async function testRoot() {
+            const resultDiv = document.getElementById('root-result');
+            try {
+                const response = await fetch(`${API_BASE}/`);
+                const data = await response.json();
+                
+                resultDiv.className = 'response success';
+                resultDiv.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                resultDiv.className = 'response error';
+                resultDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+        
+        // Auto-test on page load
+        window.addEventListener('load', () => {
+            testSupportedFormats();
+            testHealth();
+            testRoot();
+        });
+    </script>
+</body>
+</html>

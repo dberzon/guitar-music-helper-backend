@@ -83,6 +83,7 @@ app = FastAPI(
 if config.ENVIRONMENT == "production":
     allowed_origins = [
         "https://guitar-music-helper.vercel.app",
+        "https://guitar-music-helper-hq7lavby6-dberzons-projects.vercel.app",
     ]
     allow_origin_regex = r"https://guitar-music-helper-.*\.vercel\.app$"
     allow_credentials = True
@@ -219,6 +220,8 @@ async def health_check():
         "status": "healthy" if DEPENDENCIES_LOADED and MODELS_LOADED else "degraded",
         "dependencies_loaded": DEPENDENCIES_LOADED,
         "models_loaded": MODELS_LOADED,
+        "supported_formats": list(config.ALLOWED_EXTENSIONS),
+        "max_file_size_mb": config.MAX_FILE_SIZE_MB,
         "timestamp": time.time(),
     }
 
@@ -316,11 +319,12 @@ async def transcribe_audio(file: UploadFile = Depends(validate_file)):
 @app.get("/supported-formats", summary="Get Supported Formats", tags=["Status"])
 async def get_supported_formats():
     """Returns the list of supported audio formats and file size limits."""
+    formats = list(config.ALLOWED_EXTENSIONS)
+    logger.info(f"Returning supported formats: {formats}")
     return {
-        "supportedFormats": list(config.ALLOWED_EXTENSIONS),  # Frontend expects this key
-        "maxFileSizeMb": config.MAX_FILE_SIZE_MB,  # Camel case for consistency
-        # Also include snake_case versions for backward compatibility
-        "supported_formats": list(config.ALLOWED_EXTENSIONS),
+        "supportedFormats": formats,
+        "maxFileSizeMb": config.MAX_FILE_SIZE_MB,
+        "supported_formats": formats,
         "max_file_size_mb": config.MAX_FILE_SIZE_MB,
     }
 
