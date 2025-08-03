@@ -377,6 +377,16 @@ async def transcribe_audio(request: Request, file: UploadFile = Depends(validate
             except OSError as e:
                 logger.warning(f"Failed to clean up temporary file {tmp_path}: {e}")
 
+@app.options("/transcribe", summary="CORS Preflight for Transcribe", tags=["Transcription"])
+async def transcribe_options():
+    """Handle CORS preflight requests for the transcribe endpoint."""
+    return {"message": "OK"}
+
+@app.options("/{full_path:path}", summary="Handle CORS Preflight", include_in_schema=False)
+async def options_handler(full_path: str):
+    """Handle CORS preflight requests for all endpoints."""
+    return {"message": "OK"}
+
 @app.get("/supported-formats", summary="Get Supported Formats", tags=["Status"])
 async def get_supported_formats():
     """Returns the list of supported audio formats and file size limits."""
