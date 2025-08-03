@@ -116,24 +116,32 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- CORS Middleware Configuration ---
-# Always include production Vercel URLs to ensure they work regardless of environment detection
+# Define allowed origins for both production and local development
+
 base_allowed_origins = [
     "https://guitar-music-helper.vercel.app",
     "https://guitar-music-helper-hq7lavby6-dberzons-projects.vercel.app",
     "https://guitar-music-helper-4b20ml8tu-dberzons-projects.vercel.app",
+    "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app",  # ✅ your actual deployment
+]
+
+dev_allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
 ]
 
 if config.ENVIRONMENT == "production":
     allowed_origins = base_allowed_origins
     allow_origin_regex = r"https://guitar-music-helper-.*\.vercel\.app$"
     allow_credentials = True
-    logger.info(f"CORS configured for PRODUCTION.")
+    logger.info("✅ CORS configured for PRODUCTION")
 else:
-    # More permissive CORS for development - allow all origins
-    allowed_origins = ["*"]  # Allow all origins for development
+    allowed_origins = base_allowed_origins + dev_allowed_origins
     allow_origin_regex = None
-    allow_credentials = False  # Must be False when allow_origins=["*"]
-    logger.info(f"CORS configured for DEVELOPMENT with permissive settings.")
+    allow_credentials = True  # 🔐 Required when using specific origins
+    logger.info("🔧 CORS configured for DEVELOPMENT with localhost + Vercel access")
 
 app.add_middleware(
     CORSMiddleware,
