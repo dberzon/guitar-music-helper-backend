@@ -182,11 +182,17 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
 
-    if file.size and file.size > config.MAX_FILE_SIZE:
+    if file.size is not None and file.size > config.MAX_FILE_SIZE:
         size_mb = file.size / (1024 * 1024)
         raise HTTPException(
             status_code=413, # Payload Too Large
             detail=f"File is too large ({size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
+        )
+
+    if file.size == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty file provided."
         )
 
     file_extension = Path(file.filename).suffix.lower()
@@ -287,19 +293,25 @@ async def transcribe_audio(file: UploadFile = Depends(validate_file)):
             processingTime=processing_time,
             **processing_result_dict["metadata"],
         )
+        
+        # Handle tempo which might be None
+        tempo_data = processing_result_dict.get("tempo")
         result = TranscriptionResult(
             metadata=metadata,
             chords=processing_result_dict["chords"],
             melody=processing_result_dict["melody"],
-            tempo=processing_result_dict["tempo"]
+            tempo=tempo_data
         )
         return TranscriptionResponse(success=True, data=result, processingTime=processing_time)
 
     finally:
         # Ensure the temporary file is always cleaned up
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-            logger.debug(f"Cleaned up temporary file: {tmp_path}")
+            try:
+                os.unlink(tmp_path)
+                logger.debug(f"Cleaned up temporary file: {tmp_path}")
+            except OSError as e:
+                logger.warning(f"Failed to clean up temporary file {tmp_path}: {e}")
 
 @app.get("/supported-formats", summary="Get Supported Formats", tags=["Status"])
 async def get_supported_formats():
