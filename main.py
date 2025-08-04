@@ -287,16 +287,28 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
     """
     try:
         logger.info(f"Starting audio processing at path: {tmp_path}")
+        
+        # Check file size before processing
+        file_size = os.path.getsize(tmp_path)
+        logger.info(f"File size: {file_size / (1024*1024):.2f} MB")
+        
+        # Load audio with memory monitoring
+        logger.info("Loading audio with librosa...")
         audio, sr = librosa.load(tmp_path, sr=None, mono=True)
         duration = librosa.get_duration(y=audio, sr=sr)
-        logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz")
+        logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
 
+        # Run basic-pitch prediction
+        logger.info("Starting basic-pitch prediction...")
         model_output, midi_data, note_events = predict(tmp_path)
         logger.info(f"Basic-pitch prediction complete. Found {len(note_events)} note events.")
         
+        # Process the output
+        logger.info("Processing basic-pitch output...")
         transcription_data = process_basic_pitch_output(
             model_output, midi_data, note_events, sr, duration
         )
+        logger.info("Processing complete, returning results...")
         
         # Return a dictionary with the core results
         return {
@@ -390,6 +402,50 @@ async def transcribe_options():
 async def options_handler(full_path: str):
     """Handle CORS preflight requests for all endpoints."""
     return {"message": "OK"}
+
+@app.post("/test-upload", summary="Test File Upload Without Processing", tags=["Testing"])
+@limiter.limit("5/minute")
+async def test_upload(request: Request, file: UploadFile = Depends(validate_file)):
+    """
+    Test endpoint that accepts a file upload but doesn't process it.
+    Used to test if the issue is with file upload or audio processing.
+    """
+    start_time = time.time()
+    tmp_path = None
+
+    try:
+        # Save uploaded file to a temporary location using chunked streaming for memory efficiency
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp_file:
+            tmp_path = tmp_file.name
+        
+        # Use chunked streaming to avoid loading large files into memory
+        await file.seek(0)  # Ensure reading from the start
+        async with aiofiles.open(tmp_path, 'wb') as out_file:
+            while content := await file.read(1024 * 1024):  # Read in 1MB chunks
+                await out_file.write(content)
+        
+        # Get file info
+        file_size = os.path.getsize(tmp_path)
+        processing_time = time.time() - start_time
+        
+        logger.info(f"Successfully uploaded '{file.filename}' ({file_size / (1024*1024):.2f} MB) in {processing_time:.2f}s")
+        
+        return {
+            "success": True,
+            "message": "File uploaded successfully (no processing)",
+            "filename": file.filename,
+            "size_mb": round(file_size / (1024*1024), 2),
+            "upload_time": round(processing_time, 2)
+        }
+
+    finally:
+        # Ensure the temporary file is always cleaned up
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                logger.debug(f"Cleaned up temporary file: {tmp_path}")
+            except OSError as e:
+                logger.warning(f"Failed to clean up temporary file {tmp_path}: {e}")
 
 @app.get("/debug", summary="Debug Information", tags=["Status"])
 async def debug_info():
