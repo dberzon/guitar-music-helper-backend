@@ -337,6 +337,58 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         # Wrap the original exception in our custom error type
         raise AudioProcessingError(f"Prediction failed: {e}") from e
 
+@app.post("/test-dependencies", summary="Test ML Dependencies", tags=["Testing"])
+@limiter.limit("5/minute")
+async def test_dependencies(request: Request):
+    """
+    Test if ML dependencies can be imported and used without file processing.
+    """
+    try:
+        if not DEPENDENCIES_LOADED:
+            return {"success": False, "error": "Dependencies not loaded"}
+        
+        # Test basic imports
+        test_results = {
+            "librosa": "unknown",
+            "numpy": "unknown", 
+            "basic_pitch": "unknown"
+        }
+        
+        # Test librosa
+        try:
+            import librosa
+            test_results["librosa"] = f"OK - version {librosa.__version__}"
+        except Exception as e:
+            test_results["librosa"] = f"ERROR: {e}"
+        
+        # Test numpy
+        try:
+            import numpy as np
+            test_results["numpy"] = f"OK - version {np.__version__}"
+        except Exception as e:
+            test_results["numpy"] = f"ERROR: {e}"
+        
+        # Test basic-pitch predict function
+        try:
+            from basic_pitch.inference import predict
+            test_results["basic_pitch"] = "OK - predict function imported"
+        except Exception as e:
+            test_results["basic_pitch"] = f"ERROR: {e}"
+        
+        return {
+            "success": True,
+            "test_results": test_results,
+            "dependencies_loaded": DEPENDENCIES_LOADED,
+            "models_loaded": MODELS_LOADED
+        }
+        
+    except Exception as e:
+        logger.error(f"Error testing dependencies: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 @app.post("/transcribe-status", summary="Check Transcription Capability", tags=["Transcription"])
 @limiter.limit("10/minute")
 async def transcribe_status(request: Request, file: UploadFile = Depends(validate_file)):
