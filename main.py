@@ -116,44 +116,26 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- CORS Middleware Configuration ---
-# Define allowed origins for both production and local development
-
-base_allowed_origins = [
-    "https://guitar-music-helper.vercel.app",
-    "https://guitar-music-helper-hq7lavby6-dberzons-projects.vercel.app",
-    "https://guitar-music-helper-4b20ml8tu-dberzons-projects.vercel.app",
-    "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app",  # ✅ your actual deployment
-]
-
-dev_allowed_origins = [
+# For Railway deployment, we need to be more permissive since environment detection may not work as expected
+allowed_origins = [
     "http://localhost:5173",
+    "http://127.0.0.1:5173", 
     "http://localhost:5174",
-    "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
+    "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app",  # your current deployment
+    "*"  # Temporarily allow all origins to bypass CORS issues
 ]
 
-if config.ENVIRONMENT == "production":
-    allowed_origins = []
-    allow_origin_regex = r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$"
-    allow_credentials = True
-    logger.info("✅ CORS configured for PRODUCTION with regex domain matching")
-else:
-    allowed_origins = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app"  # optional fallback for dev
-    ]
-    allow_origin_regex = None
-    allow_credentials = True
-    logger.info("🔧 CORS configured for DEVELOPMENT")
+# Always allow the regex pattern for any Vercel deployment
+allow_origin_regex = r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$"
+allow_credentials = False  # Must be False when allowing all origins
+
+logger.info(f"🌐 CORS configured for {config.ENVIRONMENT} environment with permissive settings for debugging")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_origin_regex=allow_origin_regex,
-    allow_credentials=allow_credentials,
+    allow_origins=["*"],  # Temporarily allow all origins
+    allow_credentials=False,  # Must be False with wildcard
     allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
     allow_headers=["*"],
 )
