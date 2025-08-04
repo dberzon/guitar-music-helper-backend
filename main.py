@@ -240,19 +240,19 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
             detail=f"Unsupported file type '{file_extension}'. Allowed types are: {', '.join(config.ALLOWED_EXTENSIONS)}"
         )
     
-    # Validate MIME type matches the file extension
+    # Validate MIME type matches the file extension - allow common variations
     allowed_mime_types = {
-        '.wav': 'audio/wav',
-        '.mp3': 'audio/mpeg',
-        '.m4a': 'audio/x-m4a',
-        '.flac': 'audio/flac',
-        '.ogg': 'audio/ogg'
+        '.wav': ['audio/wav', 'audio/x-wav'],
+        '.mp3': ['audio/mpeg', 'audio/mp3', 'application/octet-stream'],  # Allow octet-stream for curl uploads
+        '.m4a': ['audio/x-m4a', 'audio/m4a', 'audio/mp4', 'application/octet-stream'],
+        '.flac': ['audio/flac', 'audio/x-flac', 'application/octet-stream'],
+        '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
     }
-    expected = allowed_mime_types.get(file_extension)
-    if expected and file.content_type != expected:
+    allowed_types = allowed_mime_types.get(file_extension, [])
+    if allowed_types and file.content_type not in allowed_types:
         raise HTTPException(
             status_code=415, 
-            detail=f"MIME type {file.content_type} doesn't match expected {expected} for {file_extension} files"
+            detail=f"MIME type {file.content_type} not allowed for {file_extension} files. Allowed: {', '.join(allowed_types)}"
         )
     
     return file
@@ -390,6 +390,40 @@ async def transcribe_options():
 async def options_handler(full_path: str):
     """Handle CORS preflight requests for all endpoints."""
     return {"message": "OK"}
+
+@app.get("/debug", summary="Debug Information", tags=["Status"])
+async def debug_info():
+    """Returns detailed debug information about the server state."""
+    import sys
+    import platform
+    
+    debug_data = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "dependencies_loaded": DEPENDENCIES_LOADED,
+        "models_loaded": MODELS_LOADED,
+        "config": {
+            "max_file_size_mb": config.MAX_FILE_SIZE_MB,
+            "max_workers": config.MAX_WORKERS,
+            "processing_timeout": config.PROCESSING_TIMEOUT,
+            "environment": config.ENVIRONMENT,
+        },
+        "supported_formats": list(config.ALLOWED_EXTENSIONS),
+    }
+    
+    # Try to get ML library versions if available
+    if DEPENDENCIES_LOADED:
+        try:
+            import librosa
+            import numpy as np
+            debug_data["ml_versions"] = {
+                "librosa": librosa.__version__,
+                "numpy": np.__version__,
+            }
+        except:
+            debug_data["ml_versions"] = "Error getting versions"
+    
+    return debug_data
 
 @app.get("/supported-formats", summary="Get Supported Formats", tags=["Status"])
 async def get_supported_formats():
