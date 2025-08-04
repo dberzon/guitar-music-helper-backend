@@ -3,7 +3,7 @@ import tempfile
 import time
 import asyncio
 import logging
-from typing import Dict
+from typing import Dict, TYPE_CHECKING
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -19,6 +19,20 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+# Type hints for static analysis even when imports fail
+if TYPE_CHECKING:
+    from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
+    from transcription_utils import process_basic_pitch_output
+
+# --- Constants ---
+ALLOWED_MIME_TYPES = {
+    '.wav': ['audio/wav', 'audio/x-wav'],
+    '.mp3': ['audio/mpeg', 'audio/mp3', 'application/octet-stream'],  # Allow octet-stream for curl uploads
+    '.m4a': ['audio/x-m4a', 'audio/m4a', 'audio/mp4', 'application/octet-stream'],
+    '.flac': ['audio/flac', 'audio/x-flac', 'application/octet-stream'],
+    '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
+}
+
 # --- Configure Logging ---
 # Initialize config first to get LOG_LEVEL
 class Config(BaseSettings):
@@ -28,6 +42,14 @@ class Config(BaseSettings):
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
     LOG_LEVEL: str = "INFO"
     PROCESSING_TIMEOUT: int = Field(45, description="Max processing time in seconds - increased for Railway")
+    CORS_ORIGINS: list[str] = Field(
+        default=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+        description="List of allowed CORS origins"
+    )
+    CORS_ORIGIN_REGEX: str | None = Field(
+        default=r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$",
+        description="Regex for Vercel preview deployments"
+    )
 
     @property
     def MAX_FILE_SIZE(self):
@@ -97,9 +119,7 @@ try:
 except ImportError as e:
     logger.warning(f"Could not load local models/utils. Using dummy structures. Error: {e}")
     MODELS_LOADED = False
-    # Define dummy structures for type hints and graceful failure
-    TranscriptionResponse, TranscriptionResult, TranscriptionMetadata = dict, dict, dict
-    process_basic_pitch_output = None
+    # No need to define dummy structures - TYPE_CHECKING provides types for IDEs
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
@@ -116,27 +136,15 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- CORS Middleware Configuration ---
-# For Railway deployment, we need to be more permissive since environment detection may not work as expected
-allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173", 
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app",  # your current deployment
-    "*"  # Temporarily allow all origins to bypass CORS issues
-]
-
-# Always allow the regex pattern for any Vercel deployment
-allow_origin_regex = r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$"
-allow_credentials = False  # Must be False when allowing all origins
-
-logger.info(f"🌐 CORS configured for {config.ENVIRONMENT} environment with permissive settings for debugging")
+# Configure CORS with environment-based origins for security
+logger.info(f"🌐 CORS configured for {config.ENVIRONMENT} environment")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Temporarily allow all origins
-    allow_credentials=False,  # Must be False with wildcard
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+    allow_origins=config.CORS_ORIGINS,
+    allow_origin_regex=config.CORS_ORIGIN_REGEX,
+    allow_credentials=True,  # Can be True now that we don't use "*"
+    allow_methods=["GET", "POST", "OPTIONS"],  # Be specific about allowed methods
     allow_headers=["*"],
 )
 
@@ -241,14 +249,7 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
         )
     
     # Validate MIME type matches the file extension - allow common variations
-    allowed_mime_types = {
-        '.wav': ['audio/wav', 'audio/x-wav'],
-        '.mp3': ['audio/mpeg', 'audio/mp3', 'application/octet-stream'],  # Allow octet-stream for curl uploads
-        '.m4a': ['audio/x-m4a', 'audio/m4a', 'audio/mp4', 'application/octet-stream'],
-        '.flac': ['audio/flac', 'audio/x-flac', 'application/octet-stream'],
-        '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
-    }
-    allowed_types = allowed_mime_types.get(file_extension, [])
+    allowed_types = ALLOWED_MIME_TYPES.get(file_extension, [])
     if allowed_types and file.content_type not in allowed_types:
         raise HTTPException(
             status_code=415, 
