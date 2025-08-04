@@ -337,6 +337,84 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         # Wrap the original exception in our custom error type
         raise AudioProcessingError(f"Prediction failed: {e}") from e
 
+@app.post("/test-minimal-processing", summary="Test Minimal Audio Processing", tags=["Testing"])
+@limiter.limit("3/minute")
+async def test_minimal_processing(request: Request, file: UploadFile = Depends(validate_file)):
+    """
+    Test minimal audio processing to identify where exactly the failure occurs.
+    """
+    start_time = time.time()
+    tmp_path = None
+    
+    try:
+        if not DEPENDENCIES_LOADED:
+            return {"success": False, "error": "Dependencies not loaded"}
+        
+        # Save file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp_file:
+            tmp_path = tmp_file.name
+        
+        await file.seek(0)
+        async with aiofiles.open(tmp_path, 'wb') as out_file:
+            while content := await file.read(1024 * 1024):
+                await out_file.write(content)
+        
+        file_size = os.path.getsize(tmp_path)
+        step_results = {"file_upload": f"OK - {file_size / (1024*1024):.2f} MB"}
+        
+        # Test librosa loading
+        try:
+            import librosa
+            import gc
+            gc.collect()  # Clean memory before loading
+            
+            audio, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=10.0)  # Limit to 10 seconds
+            step_results["librosa_load"] = f"OK - {len(audio)} samples at {sr}Hz"
+            
+            # Clean up audio data immediately
+            del audio
+            gc.collect()
+            
+        except Exception as e:
+            step_results["librosa_load"] = f"ERROR: {e}"
+            return {"success": False, "step_results": step_results, "failed_at": "librosa_load"}
+        
+        # Test basic-pitch prediction (this is likely where it fails)
+        try:
+            from basic_pitch.inference import predict
+            
+            # Try to predict - this might cause OOM
+            model_output, midi_data, note_events = predict(tmp_path)
+            step_results["basic_pitch_predict"] = f"OK - {len(note_events)} note events"
+            
+            # Clean up immediately
+            del model_output, midi_data, note_events
+            gc.collect()
+            
+        except Exception as e:
+            step_results["basic_pitch_predict"] = f"ERROR: {e}"
+            return {"success": False, "step_results": step_results, "failed_at": "basic_pitch_predict", "error": str(e)}
+        
+        processing_time = time.time() - start_time
+        return {
+            "success": True,
+            "step_results": step_results,
+            "processing_time": round(processing_time, 2),
+            "message": "All steps completed successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in minimal processing test: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+        
+    finally:
+        # Clean up temp file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+
 @app.post("/test-dependencies", summary="Test ML Dependencies", tags=["Testing"])
 @limiter.limit("5/minute")
 async def test_dependencies(request: Request):
