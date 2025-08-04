@@ -27,7 +27,7 @@ class Config(BaseSettings):
     MAX_WORKERS: int = 1  # Reduced to prevent memory exhaustion
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
     LOG_LEVEL: str = "INFO"
-    PROCESSING_TIMEOUT: int = Field(30, description="Max processing time in seconds")
+    PROCESSING_TIMEOUT: int = Field(45, description="Max processing time in seconds - increased for Railway")
 
     @property
     def MAX_FILE_SIZE(self):
@@ -285,6 +285,8 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
     Synchronous function to run in a thread pool. It loads an audio file,
     runs basic-pitch prediction, and processes the results.
     """
+    import gc  # Import garbage collector for memory management
+    
     try:
         logger.info(f"Starting audio processing at path: {tmp_path}")
         
@@ -292,9 +294,12 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         file_size = os.path.getsize(tmp_path)
         logger.info(f"File size: {file_size / (1024*1024):.2f} MB")
         
-        # Load audio with memory monitoring
+        # Force garbage collection before starting
+        gc.collect()
+        
+        # Load audio with memory monitoring - use lower sample rate to save memory
         logger.info("Loading audio with librosa...")
-        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
+        audio, sr = librosa.load(tmp_path, sr=22050, mono=True)  # Reduced sample rate
         duration = librosa.get_duration(y=audio, sr=sr)
         logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
 
@@ -303,12 +308,20 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         model_output, midi_data, note_events = predict(tmp_path)
         logger.info(f"Basic-pitch prediction complete. Found {len(note_events)} note events.")
         
+        # Clean up audio data from memory
+        del audio
+        gc.collect()
+        
         # Process the output
         logger.info("Processing basic-pitch output...")
         transcription_data = process_basic_pitch_output(
             model_output, midi_data, note_events, sr, duration
         )
         logger.info("Processing complete, returning results...")
+        
+        # Clean up intermediate data
+        del model_output, midi_data, note_events
+        gc.collect()
         
         # Return a dictionary with the core results
         return {
@@ -319,6 +332,8 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         }
     except Exception as e:
         logger.error(f"Core audio processing failed: {e}", exc_info=True)
+        # Force garbage collection on error
+        gc.collect()
         # Wrap the original exception in our custom error type
         raise AudioProcessingError(f"Prediction failed: {e}") from e
 
