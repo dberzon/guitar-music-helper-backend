@@ -152,13 +152,34 @@ class Config(BaseSettings):
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
     LOG_LEVEL: str = "INFO"
     PROCESSING_TIMEOUT: int = Field(45, description="Max processing time in seconds - increased for Railway")
+    
+    # Dynamic CORS configuration based on environment
     CORS_ORIGINS: list[str] = Field(
-        default=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+        default_factory=lambda: [
+            "http://localhost:5173", 
+            "http://127.0.0.1:5173", 
+            "http://localhost:5174", 
+            "http://127.0.0.1:5174",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000"
+        ],
         description="List of allowed CORS origins"
     )
     CORS_ORIGIN_REGEX: str | None = Field(
         default=r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$",
         description="Regex for Vercel preview deployments"
+    )
+    
+    # Backend identification for environment detection
+    BACKEND_URL: str = Field(
+        default="http://localhost:8000",
+        description="Backend URL for this instance"
+    )
+    
+    # Development mode settings
+    ENABLE_DEBUG_ENDPOINTS: bool = Field(
+        default=True,
+        description="Enable debug endpoints in development"
     )
 
     # Modern Pydantic v2 configuration - ignore extra environment variables
@@ -170,6 +191,16 @@ class Config(BaseSettings):
     @property
     def MAX_FILE_SIZE(self):
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
+    
+    @property
+    def is_development(self) -> bool:
+        """Check if running in development mode"""
+        return self.ENVIRONMENT.lower() in ["development", "dev", "local"]
+    
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production mode"""
+        return self.ENVIRONMENT.lower() in ["production", "prod"]
 
     @validator('MAX_FILE_SIZE_MB')
     def validate_max_file_size(cls, v):
@@ -251,8 +282,8 @@ app = FastAPI(
     title="Guitar Music Helper - Audio Transcription API",
     description="An API to transcribe guitar audio into notes and chords using basic-pitch.",
     version="1.0.0",
-    docs_url="/docs" if config.ENVIRONMENT == "development" else None,
-    redoc_url="/redoc" if config.ENVIRONMENT == "development" else None,
+    docs_url="/docs" if config.is_development else None,
+    redoc_url="/redoc" if config.is_development else None,
     lifespan=lifespan,
 )
 
@@ -412,6 +443,20 @@ async def root():
         "service": "Guitar Music Helper Audio Transcription API",
         "version": "1.0.0",
         "status": "healthy" if DEPENDENCIES_LOADED and MODELS_LOADED else "degraded",
+        "environment": config.ENVIRONMENT,
+        "backend_url": config.BACKEND_URL,
+    }
+
+@app.get("/environment", summary="Environment Information", tags=["Status"])
+async def environment_info():
+    """Provides environment configuration information for frontend connection."""
+    return {
+        "environment": config.ENVIRONMENT,
+        "backend_url": config.BACKEND_URL,
+        "is_development": config.is_development,
+        "is_production": config.is_production,
+        "cors_origins": config.CORS_ORIGINS,
+        "debug_endpoints_enabled": config.ENABLE_DEBUG_ENDPOINTS,
     }
 
 @app.get("/health", summary="Health Check", tags=["Status"])
@@ -545,7 +590,7 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
 @app.post("/test-minimal-processing", 
     summary="Test Minimal Audio Processing", 
     tags=["Diagnostics"],
-    include_in_schema=(config.ENVIRONMENT == "development")
+    include_in_schema=config.ENABLE_DEBUG_ENDPOINTS
 )
 @limiter.limit("3/minute")
 async def test_minimal_processing(request: Request, file: UploadFile = Depends(validate_file)):
@@ -627,7 +672,7 @@ async def test_minimal_processing(request: Request, file: UploadFile = Depends(v
 @app.post("/test-dependencies", 
     summary="Test ML Dependencies", 
     tags=["Diagnostics"],
-    include_in_schema=(config.ENVIRONMENT == "development")
+    include_in_schema=config.ENABLE_DEBUG_ENDPOINTS
 )
 @limiter.limit("5/minute")
 async def test_dependencies(request: Request):
@@ -831,7 +876,7 @@ async def options_handler(full_path: str):
 @app.post("/test-upload", 
     summary="Test File Upload Without Processing", 
     tags=["Diagnostics"],
-    include_in_schema=(config.ENVIRONMENT == "development")
+    include_in_schema=config.ENABLE_DEBUG_ENDPOINTS
 )
 @limiter.limit("5/minute")
 async def test_upload(request: Request, file: UploadFile = Depends(validate_file)):
