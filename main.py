@@ -143,6 +143,8 @@ async def temporary_audio_file(file: UploadFile):
 
 # --- Configure Logging ---
 # Initialize config first to get LOG_LEVEL
+from pydantic_settings import SettingsConfigDict
+
 class Config(BaseSettings):
     MAX_FILE_SIZE_MB: int = Field(10, description="Max file size in MB - reduced for Railway memory limits")
     ALLOWED_EXTENSIONS: set[str] = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
@@ -157,6 +159,12 @@ class Config(BaseSettings):
     CORS_ORIGIN_REGEX: str | None = Field(
         default=r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$",
         description="Regex for Vercel preview deployments"
+    )
+
+    # Modern Pydantic v2 configuration - ignore extra environment variables
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra='ignore'  # Ignore extra environment variables to prevent errors
     )
 
     @property
@@ -174,9 +182,6 @@ class Config(BaseSettings):
         if v < 10 or v > 300:
             raise ValueError('PROCESSING_TIMEOUT must be between 10 and 300 seconds')
         return v
-
-    class Config:
-        env_file = ".env"
 
 config = Config()
 
