@@ -3,7 +3,8 @@ import tempfile
 import time
 import asyncio
 import logging
-from typing import Dict, TYPE_CHECKING
+import uuid
+from typing import Dict, TYPE_CHECKING, TypedDict, List, Optional, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -14,15 +15,31 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import aiofiles
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+# Memory monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
 
 # Type hints for static analysis even when imports fail
 if TYPE_CHECKING:
     from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
     from transcription_utils import process_basic_pitch_output
+
+# --- Types ---
+class ProcessingResult(TypedDict):
+    """Type definition for audio processing results"""
+    metadata: Dict[str, Union[float, int]]
+    chords: List[Dict[str, Union[str, float]]]
+    melody: List[Dict[str, Union[str, float]]]
+    tempo: Optional[float]  # Tempo is typically a single float (BPM)
 
 # --- Constants ---
 ALLOWED_MIME_TYPES = {
@@ -32,6 +49,97 @@ ALLOWED_MIME_TYPES = {
     '.flac': ['audio/flac', 'audio/x-flac', 'application/octet-stream'],
     '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
 }
+
+# --- Memory Management Utilities ---
+def get_memory_usage() -> float:
+    """Get current memory usage in MB"""
+    if not PSUTIL_AVAILABLE:
+        return 0.0
+    try:
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024
+    except Exception:
+        return 0.0
+
+def check_memory_availability(estimated_mb: float) -> bool:
+    """Check if there's enough memory available"""
+    if not PSUTIL_AVAILABLE:
+        return True  # Assume OK if psutil not available
+    try:
+        current_usage = get_memory_usage()
+        available = psutil.virtual_memory().available / 1024 / 1024
+        return available > estimated_mb * 1.5  # 50% buffer
+    except Exception:
+        return True  # Assume OK on error
+
+# --- Simple Metrics Collection ---
+from datetime import datetime
+from collections import defaultdict
+
+class SimpleMetrics:
+    """Simple in-memory metrics collection for monitoring"""
+    def __init__(self):
+        self.request_count = defaultdict(int)
+        self.error_count = defaultdict(int) 
+        self.processing_times = []
+        
+    def record_request(self, endpoint: str):
+        """Record a request to an endpoint"""
+        self.request_count[endpoint] += 1
+        
+    def record_error(self, endpoint: str, error_type: str):
+        """Record an error for an endpoint"""
+        self.error_count[f"{endpoint}:{error_type}"] += 1
+        
+    def record_processing_time(self, endpoint: str, duration: float):
+        """Record processing time for an endpoint"""
+        self.processing_times.append((datetime.now(), endpoint, duration))
+        # Keep only last 100 entries to prevent memory growth
+        if len(self.processing_times) > 100:
+            self.processing_times = self.processing_times[-100:]
+    
+    def get_stats(self) -> dict:
+        """Get current metrics statistics"""
+        avg_time = 0.0
+        if self.processing_times:
+            avg_time = sum(t[2] for t in self.processing_times) / len(self.processing_times)
+        
+        return {
+            "requests": dict(self.request_count),
+            "errors": dict(self.error_count),
+            "avg_processing_time_seconds": round(avg_time, 2),
+            "total_requests": sum(self.request_count.values()),
+            "total_errors": sum(self.error_count.values()),
+            "current_memory_usage_mb": get_memory_usage() if PSUTIL_AVAILABLE else None
+        }
+
+# --- File Management Utilities ---
+@asynccontextmanager
+async def temporary_audio_file(file: UploadFile):
+    """Context manager for temporary file handling with automatic cleanup"""
+    tmp_path = None
+    try:
+        # Create temp file
+        suffix = Path(file.filename).suffix
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = tmp_file.name
+            
+        # Stream file content efficiently
+        await file.seek(0)
+        async with aiofiles.open(tmp_path, 'wb') as out_file:
+            while content := await file.read(1024 * 1024):  # 1MB chunks
+                await out_file.write(content)
+                
+        logger.debug(f"Temporary file created: {tmp_path}")
+        yield tmp_path
+        
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                logger.debug(f"Cleaned up temporary file: {tmp_path}")
+            except Exception as e:
+                logger.error(f"Failed to cleanup {tmp_path}: {e}")
 
 # --- Configure Logging ---
 # Initialize config first to get LOG_LEVEL
@@ -54,6 +162,18 @@ class Config(BaseSettings):
     @property
     def MAX_FILE_SIZE(self):
         return self.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    @validator('MAX_FILE_SIZE_MB')
+    def validate_max_file_size(cls, v):
+        if v < 1 or v > 100:
+            raise ValueError('MAX_FILE_SIZE_MB must be between 1 and 100')
+        return v
+    
+    @validator('PROCESSING_TIMEOUT')
+    def validate_timeout(cls, v):
+        if v < 10 or v > 300:
+            raise ValueError('PROCESSING_TIMEOUT must be between 10 and 300 seconds')
+        return v
 
     class Config:
         env_file = ".env"
@@ -135,6 +255,20 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Initialize metrics collection
+app.state.metrics = SimpleMetrics()
+
+# --- Request ID Middleware ---
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Add unique request ID for tracing"""
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 # --- CORS Middleware Configuration ---
 # Configure CORS with environment-based origins for security
 logger.info(f"🌐 CORS configured for {config.ENVIRONMENT} environment")
@@ -185,7 +319,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(AudioProcessingError)
 async def audio_processing_error_handler(request: Request, exc: AudioProcessingError):
     """Handles errors specific to the audio processing pipeline."""
-    logger.warning(f"Audio processing error for request {request.url}: {exc}")
+    request_id = getattr(request.state, 'request_id', None)
+    logger.warning(f"Audio processing error for request {request.url} (ID: {request_id}): {exc}")
     return JSONResponse(
         status_code=422,  # Unprocessable Entity
         content={
@@ -194,6 +329,7 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
                 "code": "AUDIO_PROCESSING_ERROR",
                 "message": "Failed to process the provided audio file.",
                 "details": str(exc),
+                "request_id": request_id
             },
         },
     )
@@ -201,7 +337,8 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
 @app.exception_handler(DependencyError)
 async def dependency_error_handler(request: Request, exc: DependencyError):
     """Handles errors when required libraries are not loaded."""
-    logger.error(f"Dependency error for request {request.url}: {exc}")
+    request_id = getattr(request.state, 'request_id', None)
+    logger.error(f"Dependency error for request {request.url} (ID: {request_id}): {exc}")
     return JSONResponse(
         status_code=503,  # Service Unavailable
         content={
@@ -210,10 +347,15 @@ async def dependency_error_handler(request: Request, exc: DependencyError):
                 "code": "SERVICE_UNAVAILABLE",
                 "message": "The transcription service is temporarily unavailable.",
                 "details": str(exc),
+                "request_id": request_id
             },
         },
     )
 # --- Dependency Injection & Validation Helpers ---
+
+def get_metrics_collector(request: Request) -> SimpleMetrics:
+    """Dependency to get the metrics collector instance."""
+    return request.app.state.metrics
 
 def check_dependencies():
     """Dependency to ensure all required libraries are loaded before processing a request."""
@@ -279,12 +421,74 @@ async def health_check():
         "timestamp": time.time(),
     }
 
+@app.get("/health/detailed", summary="Detailed Health Check", tags=["Status"])
+async def detailed_health_check():
+    """More comprehensive health check including system resources"""
+    checks = {
+        "api": "healthy",
+        "dependencies": DEPENDENCIES_LOADED,
+        "models": MODELS_LOADED,
+        "memory": {
+            "used_mb": get_memory_usage(),
+            "psutil_available": PSUTIL_AVAILABLE
+        },
+        "executor": {
+            "max_workers": config.MAX_WORKERS
+        }
+    }
+    
+    # Add more detailed memory info if psutil is available
+    if PSUTIL_AVAILABLE:
+        try:
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage(tempfile.gettempdir())
+            checks["memory"].update({
+                "available_mb": mem.available / 1024 / 1024,
+                "percent_used": mem.percent
+            })
+            checks["disk"] = {
+                "temp_dir_free_gb": disk.free / 1024**3
+            }
+        except Exception as e:
+            checks["memory"]["error"] = str(e)
+    
+    # Determine overall health
+    status = "healthy"
+    if not DEPENDENCIES_LOADED or not MODELS_LOADED:
+        status = "degraded"
+    elif PSUTIL_AVAILABLE and checks["memory"].get("percent_used", 0) > 90:
+        status = "warning"
+    
+    return {"status": status, "checks": checks}
+
+# --- Audio Processing Helper Functions ---
+def load_audio_file(file_path: str, max_duration: Optional[float] = None) -> tuple:
+    """Load audio file with memory-efficient settings"""
+    try:
+        audio, sr = librosa.load(file_path, sr=22050, mono=True, duration=max_duration)
+        duration = librosa.get_duration(y=audio, sr=sr)
+        logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
+        return audio, sr, duration
+    except Exception as e:
+        logger.error(f"Failed to load audio file {file_path}: {e}")
+        raise
+
+def run_basic_pitch_prediction(file_path: str) -> tuple:
+    """Run basic-pitch prediction on audio file"""
+    try:
+        model_output, midi_data, note_events = predict(file_path)
+        logger.info(f"Basic-pitch prediction complete. Found {len(note_events)} note events.")
+        return model_output, midi_data, note_events
+    except Exception as e:
+        logger.error(f"Basic-pitch prediction failed for {file_path}: {e}")
+        raise
+
 # --- Synchronous Processing Function ---
 
-def process_audio_file_sync(tmp_path: str) -> Dict:
+def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
     """
-    Synchronous function to run in a thread pool. It loads an audio file,
-    runs basic-pitch prediction, and processes the results.
+    Orchestrator function that coordinates audio processing steps.
+    Broken down into smaller, testable functions for better maintainability.
     """
     import gc  # Import garbage collector for memory management
     
@@ -298,20 +502,15 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         # Force garbage collection before starting
         gc.collect()
         
-        # Load audio with memory monitoring - use lower sample rate to save memory
-        logger.info("Loading audio with librosa...")
-        audio, sr = librosa.load(tmp_path, sr=22050, mono=True)  # Reduced sample rate
-        duration = librosa.get_duration(y=audio, sr=sr)
-        logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
-
-        # Run basic-pitch prediction
-        logger.info("Starting basic-pitch prediction...")
-        model_output, midi_data, note_events = predict(tmp_path)
-        logger.info(f"Basic-pitch prediction complete. Found {len(note_events)} note events.")
+        # Load audio file
+        audio, sr, duration = load_audio_file(tmp_path)
         
-        # Clean up audio data from memory
+        # Free memory immediately after getting duration info
         del audio
         gc.collect()
+        
+        # Run basic-pitch prediction
+        model_output, midi_data, note_events = run_basic_pitch_prediction(tmp_path)
         
         # Process the output
         logger.info("Processing basic-pitch output...")
@@ -336,9 +535,13 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         # Force garbage collection on error
         gc.collect()
         # Wrap the original exception in our custom error type
-        raise AudioProcessingError(f"Prediction failed: {e}") from e
+        raise AudioProcessingError(f"Processing failed: {e}") from e
 
-@app.post("/test-minimal-processing", summary="Test Minimal Audio Processing", tags=["Testing"])
+@app.post("/test-minimal-processing", 
+    summary="Test Minimal Audio Processing", 
+    tags=["Diagnostics"],
+    include_in_schema=(config.ENVIRONMENT == "development")
+)
 @limiter.limit("3/minute")
 async def test_minimal_processing(request: Request, file: UploadFile = Depends(validate_file)):
     """
@@ -416,7 +619,11 @@ async def test_minimal_processing(request: Request, file: UploadFile = Depends(v
             except:
                 pass
 
-@app.post("/test-dependencies", summary="Test ML Dependencies", tags=["Testing"])
+@app.post("/test-dependencies", 
+    summary="Test ML Dependencies", 
+    tags=["Diagnostics"],
+    include_in_schema=(config.ENVIRONMENT == "development")
+)
 @limiter.limit("5/minute")
 async def test_dependencies(request: Request):
     """
@@ -518,69 +725,93 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
     dependencies=[Depends(check_dependencies)], # Protects the endpoint if dependencies are missing
 )
 @limiter.limit("5/minute")
-async def transcribe_audio(request: Request, file: UploadFile = Depends(validate_file)):
+async def transcribe_audio(
+    request: Request, 
+    file: UploadFile = Depends(validate_file),
+    metrics: SimpleMetrics = Depends(get_metrics_collector)
+):
     """
     Accepts an audio file, transcribes it to find chords and melody,
     and returns the structured data.
     """
     start_time = time.time()
-    tmp_path = None
+    endpoint_name = "transcribe"
+    
+    # Record request using injected metrics
+    metrics.record_request(endpoint_name)
 
     try:
-        # Save uploaded file to a temporary location using chunked streaming for memory efficiency
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp_file:
-            tmp_path = tmp_file.name
+        # Check memory before processing
+        file_size_mb = file.size / (1024 * 1024) if file.size else 0
+        estimated_memory = file_size_mb * 4  # Conservative estimate
+        railway_memory_limit = 500  # Conservative estimate for Railway
         
-        # Use chunked streaming to avoid loading large files into memory
-        await file.seek(0)  # Ensure reading from the start
-        async with aiofiles.open(tmp_path, 'wb') as out_file:
-            while content := await file.read(1024 * 1024):  # Read in 1MB chunks
-                await out_file.write(content)
+        # Warn if close to memory limit
+        if estimated_memory > railway_memory_limit * 0.8:  # 80% threshold
+            logger.warning(f"File {file.filename} is using {estimated_memory:.2f}MB - close to memory limit")
         
-        logger.info(f"File '{file.filename}' saved to temp path: {tmp_path} using chunked streaming")
-        
-        # Run the blocking, CPU-intensive function in the thread pool with timeout
-        executor = request.app.state.executor
-        loop = asyncio.get_event_loop()
-        
-        # Add timeout to prevent Railway from timing out
-        try:
-            processing_result_dict = await asyncio.wait_for(
-                loop.run_in_executor(executor, process_audio_file_sync, tmp_path),
-                timeout=config.PROCESSING_TIMEOUT
+        if not check_memory_availability(estimated_memory):
+            logger.warning(f"Insufficient memory for file {file.filename} ({file_size_mb:.2f}MB, estimated {estimated_memory:.2f}MB needed)")
+            metrics.record_error(endpoint_name, "insufficient_memory")
+            raise HTTPException(
+                status_code=507,  # Insufficient Storage
+                detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later."
             )
-        except asyncio.TimeoutError:
-            logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
-            raise AudioProcessingError(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds. Try uploading a smaller file.")
-        
-        processing_time = time.time() - start_time
-        logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s")
 
-        # Construct the final Pydantic response model
-        metadata = TranscriptionMetadata(
-            filename=file.filename,
-            processingTime=processing_time,
-            **processing_result_dict["metadata"],
-        )
-        
-        # Handle tempo which might be None
-        tempo_data = processing_result_dict.get("tempo")
-        result = TranscriptionResult(
-            metadata=metadata,
-            chords=processing_result_dict["chords"],
-            melody=processing_result_dict["melody"],
-            tempo=tempo_data
-        )
-        return TranscriptionResponse(success=True, data=result, processingTime=processing_time)
-
-    finally:
-        # Ensure the temporary file is always cleaned up
-        if tmp_path and os.path.exists(tmp_path):
+        # Use context manager for automatic file cleanup
+        async with temporary_audio_file(file) as tmp_path:
+            logger.info(f"File '{file.filename}' saved using context manager. Memory usage: {get_memory_usage():.1f}MB")
+            
+            # Run the blocking, CPU-intensive function in the thread pool with timeout
+            executor = request.app.state.executor
+            loop = asyncio.get_event_loop()
+            
+            # Add timeout to prevent Railway from timing out
             try:
-                os.unlink(tmp_path)
-                logger.debug(f"Cleaned up temporary file: {tmp_path}")
-            except OSError as e:
-                logger.warning(f"Failed to clean up temporary file {tmp_path}: {e}")
+                processing_result_dict = await asyncio.wait_for(
+                    loop.run_in_executor(executor, process_audio_file_sync, tmp_path),
+                    timeout=config.PROCESSING_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
+                metrics.record_error(endpoint_name, "timeout")
+                raise AudioProcessingError(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds. Try uploading a smaller file.")
+            
+            processing_time = time.time() - start_time
+            logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s. Final memory usage: {get_memory_usage():.1f}MB")
+
+            # Record successful processing time using injected metrics
+            metrics.record_processing_time(endpoint_name, processing_time)
+
+            # Construct the final Pydantic response model
+            metadata = TranscriptionMetadata(
+                filename=file.filename,
+                processingTime=processing_time,
+                **processing_result_dict["metadata"],
+            )
+            
+            # Handle tempo which might be None
+            tempo_data = processing_result_dict.get("tempo")
+            result = TranscriptionResult(
+                metadata=metadata,
+                chords=processing_result_dict["chords"],
+                melody=processing_result_dict["melody"],
+                tempo=tempo_data
+            )
+            return TranscriptionResponse(success=True, data=result, processingTime=processing_time)
+            
+        # File automatically cleaned up by context manager
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is (already recorded above)
+        raise
+    except AudioProcessingError as e:
+        metrics.record_error(endpoint_name, "processing_error")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in transcribe_audio: {e}", exc_info=True)
+        metrics.record_error(endpoint_name, "unexpected_error")
+        raise AudioProcessingError(f"Transcription failed: {e}") from e
 
 @app.options("/transcribe", summary="CORS Preflight for Transcribe", tags=["Transcription"])
 async def transcribe_options():
@@ -592,7 +823,11 @@ async def options_handler(full_path: str):
     """Handle CORS preflight requests for all endpoints."""
     return {"message": "OK"}
 
-@app.post("/test-upload", summary="Test File Upload Without Processing", tags=["Testing"])
+@app.post("/test-upload", 
+    summary="Test File Upload Without Processing", 
+    tags=["Diagnostics"],
+    include_in_schema=(config.ENVIRONMENT == "development")
+)
 @limiter.limit("5/minute")
 async def test_upload(request: Request, file: UploadFile = Depends(validate_file)):
     """
@@ -678,6 +913,33 @@ async def get_supported_formats():
     return {
         "supportedFormats": formats,
         "maxFileSizeMb": config.MAX_FILE_SIZE_MB
+    }
+
+@app.get("/metrics", summary="Get API Metrics", tags=["Status"])
+async def get_metrics():
+    """Return basic API usage metrics"""
+    try:
+        return app.state.metrics.get_stats()
+    except Exception as e:
+        logger.error(f"Error retrieving metrics: {e}")
+        return {"error": "Failed to retrieve metrics"}
+
+@app.get("/rate-limits", summary="Get Rate Limit Information", tags=["Status"])
+async def get_rate_limits():
+    """Return information about API rate limits"""
+    return {
+        "endpoints": {
+            "/transcribe": "5 requests per minute",
+            "/test-minimal-processing": "3 requests per minute", 
+            "/test-dependencies": "5 requests per minute",
+            "/transcribe-status": "10 requests per minute",
+            "/test-upload": "5 requests per minute"
+        },
+        "rate_limit_headers": {
+            "remaining": "X-RateLimit-Remaining",
+            "reset": "X-RateLimit-Reset"
+        },
+        "note": "Rate limits are per IP address"
     }
 
 
