@@ -337,6 +337,49 @@ def process_audio_file_sync(tmp_path: str) -> Dict:
         # Wrap the original exception in our custom error type
         raise AudioProcessingError(f"Prediction failed: {e}") from e
 
+@app.post("/transcribe-status", summary="Check Transcription Capability", tags=["Transcription"])
+@limiter.limit("10/minute")
+async def transcribe_status(request: Request, file: UploadFile = Depends(validate_file)):
+    """
+    Test endpoint to check if transcription would be possible without actually processing.
+    Returns estimated memory requirements and processing feasibility.
+    """
+    try:
+        file_size_mb = file.size / (1024 * 1024) if file.size else 0
+        
+        # Estimate memory requirements (rough calculation)
+        # Basic-pitch typically needs 3-5x the audio file size in memory
+        estimated_memory_mb = file_size_mb * 4  # Conservative estimate
+        
+        # Railway Hobby plan has ~512MB available memory
+        railway_memory_limit = 500  # Conservative estimate
+        
+        return {
+            "success": True,
+            "file_info": {
+                "filename": file.filename,
+                "size_mb": round(file_size_mb, 2),
+                "format": Path(file.filename).suffix.lower()
+            },
+            "memory_analysis": {
+                "estimated_memory_needed_mb": round(estimated_memory_mb, 2),
+                "railway_memory_limit_mb": railway_memory_limit,
+                "feasible": estimated_memory_mb < railway_memory_limit,
+                "recommendation": "File too large for current Railway plan" if estimated_memory_mb >= railway_memory_limit else "Processing should be feasible"
+            },
+            "dependencies": {
+                "dependencies_loaded": DEPENDENCIES_LOADED,
+                "models_loaded": MODELS_LOADED
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in transcribe-status: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 @app.post(
     "/transcribe",
     summary="Transcribe Audio File",
