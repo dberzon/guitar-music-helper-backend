@@ -133,15 +133,21 @@ dev_allowed_origins = [
 ]
 
 if config.ENVIRONMENT == "production":
-    allowed_origins = base_allowed_origins
-    allow_origin_regex = r"https://guitar-music-helper-.*\.vercel\.app$"
+    allowed_origins = []
+    allow_origin_regex = r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$"
     allow_credentials = True
-    logger.info("✅ CORS configured for PRODUCTION")
+    logger.info("✅ CORS configured for PRODUCTION with regex domain matching")
 else:
-    allowed_origins = base_allowed_origins + dev_allowed_origins
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "https://guitar-music-helper-q5rqnu5sh-dberzons-projects.vercel.app"  # optional fallback for dev
+    ]
     allow_origin_regex = None
-    allow_credentials = True  # 🔐 Required when using specific origins
-    logger.info("🔧 CORS configured for DEVELOPMENT with localhost + Vercel access")
+    allow_credentials = True
+    logger.info("🔧 CORS configured for DEVELOPMENT")
 
 app.add_middleware(
     CORSMiddleware,
