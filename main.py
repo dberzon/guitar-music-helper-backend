@@ -161,7 +161,9 @@ class Config(BaseSettings):
             "http://localhost:5174", 
             "http://127.0.0.1:5174",
             "http://localhost:3000",
-            "http://127.0.0.1:3000"
+            "http://127.0.0.1:3000",
+            # Add explicit Vercel production URL
+            "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app"
         ],
         description="List of allowed CORS origins"
     )
