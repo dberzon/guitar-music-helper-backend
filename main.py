@@ -282,8 +282,8 @@ except ImportError as e:
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Guitar Music Helper - Audio Transcription API",
-    description="An API to transcribe guitar audio into notes and chords using basic-pitch.",
-    version="1.0.0",
+    description="An AI-powered API to transcribe guitar audio into notes and chords using basic-pitch. Now supporting files up to 50MB.",
+    version="1.3.0",
     docs_url="/docs" if config.is_development else None,
     redoc_url="/redoc" if config.is_development else None,
     lifespan=lifespan,

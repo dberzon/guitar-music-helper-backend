@@ -7,7 +7,8 @@ This document provides detailed API documentation for the Guitar Music Helper Au
 
 ## Base URL
 ```
-http://localhost:8000
+Production: https://web-production-84b20.up.railway.app
+Development: http://localhost:8000
 ```
 
 ## Authentication
@@ -18,11 +19,11 @@ This API does not require authentication for basic usage.
 ## Endpoints
 
 ### 1. Health Check
-Check if the API service is running and healthy.
+Check if the API service is running and dependencies are loaded.
 
 **Endpoint:** `GET /health`
 
-**Description:** Returns the current health status of the service.
+**Description:** Returns the current health status of the service and its dependencies.
 
 **Request:**
 ```
@@ -33,17 +34,51 @@ GET /health
 ```json
 {
   "status": "healthy",
-  "timestamp": "2023-12-07T10:30:00Z"
+  "dependencies_loaded": true,
+  "models_loaded": true,
+  "supported_formats": [".wav", ".mp3", ".m4a", ".flac", ".ogg"],
+  "max_file_size_mb": 50,
+  "timestamp": 1692089400.123
 }
 ```
 
 **Response Fields:**
-- `status` (string): Always "healthy" when service is running
-- `timestamp` (string): ISO 8601 formatted timestamp of the health check
+- `status` (string): "healthy", "unhealthy", or "degraded"
+- `dependencies_loaded` (boolean): Whether ML dependencies are loaded
+- `models_loaded` (boolean): Whether transcription models are available
+- `supported_formats` (array): List of supported file extensions
+- `max_file_size_mb` (number): Maximum file size in megabytes
+- `timestamp` (number): Unix timestamp of the health check
 
 ---
 
-### 2. Transcribe Audio
+### 2. Get Supported Formats
+Get information about supported file formats and size limits.
+
+**Endpoint:** `GET /supported-formats`
+
+**Description:** Returns the list of supported audio formats and current file size limits.
+
+**Request:**
+```
+GET /supported-formats
+```
+
+**Response (200 OK):**
+```json
+{
+  "supportedFormats": [".wav", ".mp3", ".m4a", ".flac", ".ogg"],
+  "maxFileSizeMb": 50
+}
+```
+
+**Response Fields:**
+- `supportedFormats` (array): List of supported file extensions
+- `maxFileSizeMb` (number): Maximum file size in megabytes
+
+---
+
+### 3. Transcribe Audio
 Transcribe an audio file to extract musical information including melody, chords, and tempo.
 
 **Endpoint:** `POST /transcribe`
@@ -59,56 +94,76 @@ Content-Type: multipart/form-data
 **Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| file | file | Yes | Audio file (MP3, WAV, M4A, FLAC) |
-| min_confidence | float | No | Minimum confidence threshold (0.0-1.0, default: 0.5) |
+| file | file | Yes | Audio file (MP3, WAV, M4A, FLAC, OGG) |
 
 **File Requirements:**
-- **Supported Formats:** MP3, WAV, M4A, FLAC
-- **Maximum Size:** 50MB
-- **Recommended Quality:** 44.1kHz, 16-bit
-- **Maximum Duration:** 5 minutes (for optimal performance)
+- **Supported Formats:** MP3, WAV, M4A, FLAC, OGG
+- **Maximum Size:** 50MB (increased from previous 10MB limit)
+- **Recommended Quality:** 22.05kHz sample rate for optimal processing
+- **Maximum Duration:** Up to 5 minutes for reliable processing
 
 **Response (200 OK):**
 ```json
 {
-  "melody": [
-    {
-      "time": 0.5,
-      "duration": 0.25,
-      "pitch": 64,
-      "frequency": 329.63,
-      "confidence": 0.95
+  "success": true,
+  "data": {
+    "metadata": {
+      "filename": "guitar-sample.mp3",
+      "duration": 180.5,
+      "sampleRate": 22050,
+      "processingTime": 5.2
     },
-    {
-      "time": 0.75,
-      "duration": 0.5,
-      "pitch": 67,
-      "frequency": 392.0,
-      "confidence": 0.88
+    "melody": [
+      {
+        "time": 0.5,
+        "duration": 0.25,
+        "pitch": 64,
+        "frequency": 329.63,
+        "confidence": 0.95
+      },
+      {
+        "time": 0.75,
+        "duration": 0.5,
+        "pitch": 67,
+        "frequency": 392.0,
+        "confidence": 0.88
+      }
+    ],
+    "chords": [
+      {
+        "time": 0.0,
+        "duration": 2.0,
+        "chord": "C major",
+        "confidence": 0.92
+      },
+      {
+        "time": 2.0,
+        "duration": 2.0,
+        "chord": "G major",
+        "confidence": 0.85
+      }
+    ],
+    "tempo": {
+      "bpm": 120.5,
+      "confidence": 0.94
     }
-  ],
-  "chords": [
-    {
-      "time": 0.0,
-      "duration": 2.0,
-      "chord": "Cmaj",
-      "confidence": 0.92
-    },
-    {
-      "time": 2.0,
-      "duration": 2.0,
-      "chord": "Gmaj",
-      "confidence": 0.85
-    }
-  ],
-  "tempo": {
-    "bpm": 120.5,
-    "confidence": 0.94
-  }
+  },
+  "processingTime": 5.2
 }
 ```
 
 **Response Fields:**
+
+#### Success Response Structure
+- `success` (boolean): Always true for successful transcriptions
+- `data` (object): Contains all transcription results
+- `processingTime` (float): Total processing time in seconds
+
+#### Metadata Object
+- `filename` (string): Original filename of the uploaded audio
+- `duration` (float): Duration of the audio in seconds
+- `sampleRate` (number): Sample rate used for processing (typically 22050 Hz)
+- `processingTime` (float): Time taken to process the audio in seconds
 
 #### Melody Array
 Each melody note contains:
@@ -122,7 +177,7 @@ Each melody note contains:
 Each chord contains:
 - `time` (float): Start time in seconds
 - `duration` (float): Duration of the chord in seconds
-- `chord` (string): Chord symbol (e.g., "Cmaj", "Am", "G7")
+- `chord` (string): Chord name (e.g., "C major", "A minor", "G major")
 - `confidence` (float): Detection confidence score (0.0-1.0)
 
 #### Tempo Object
@@ -180,52 +235,64 @@ Returned when an unexpected server error occurs.
 ### cURL Example
 ```bash
 # Basic transcription
+curl -X POST "https://web-production-84b20.up.railway.app/transcribe" \
+  -F "file=@guitar_sample.mp3"
+
+# Local development
 curl -X POST "http://localhost:8000/transcribe" \
   -F "file=@guitar_sample.mp3"
 
-# With custom confidence threshold
-curl -X POST "http://localhost:8000/transcribe" \
-  -F "file=@guitar_sample.mp3" \
-  -F "min_confidence=0.7"
+# Check supported formats
+curl "https://web-production-84b20.up.railway.app/supported-formats"
 ```
 
 ### Python Example
 ```python
 import requests
 
+# Production URL
+url = "https://web-production-84b20.up.railway.app/transcribe"
+
 # Basic usage
-url = "http://localhost:8000/transcribe"
 files = {"file": open("guitar_sample.mp3", "rb")}
 response = requests.post(url, files=files)
 data = response.json()
 
-# With parameters
-params = {"min_confidence": 0.7}
-response = requests.post(url, files=files, params=params)
-data = response.json()
-
-# Access results
-melody_notes = data["melody"]
-chords = data["chords"]
-tempo = data["tempo"]["bpm"]
+# Check if successful
+if data["success"]:
+    transcription = data["data"]
+    melody_notes = transcription["melody"]
+    chords = transcription["chords"]
+    tempo = transcription["tempo"]["bpm"]
+    processing_time = data["processingTime"]
+    
+    print(f"Processed in {processing_time:.2f} seconds")
+    print(f"Found {len(melody_notes)} notes and {len(chords)} chords")
+    print(f"Tempo: {tempo:.1f} BPM")
 ```
 
 ### JavaScript Example
 ```javascript
-// Using fetch API
+// Using fetch API with production URL
 const formData = new FormData();
 formData.append('file', audioFile);
-formData.append('min_confidence', '0.7');
 
-fetch('http://localhost:8000/transcribe', {
+fetch('https://web-production-84b20.up.railway.app/transcribe', {
   method: 'POST',
   body: formData
 })
 .then(response => response.json())
 .then(data => {
-  console.log('Melody:', data.melody);
-  console.log('Chords:', data.chords);
-  console.log('Tempo:', data.tempo.bpm);
+  if (data.success) {
+    const transcription = data.data;
+    console.log('Melody:', transcription.melody);
+    console.log('Chords:', transcription.chords);
+    console.log('Tempo:', transcription.tempo.bpm);
+    console.log('Processing time:', data.processingTime);
+  }
+})
+.catch(error => {
+  console.error('Error:', error);
 });
 ```
 
@@ -248,12 +315,14 @@ Currently, there are no rate limits on the API. However, for production use, con
 - **Content**: Clear, isolated guitar audio yields best results
 
 ### Expected Processing Times
-| File Size | Duration | Processing Time |
-|-----------|----------|-----------------|
-| < 1MB | < 10s | 1-3 seconds |
-| 1-5MB | 10-30s | 3-8 seconds |
-| 5-20MB | 30s-2min | 8-20 seconds |
-| 20-50MB | 2-5min | 20-60 seconds |
+| File Size | Duration | Processing Time | Memory Usage |
+|-----------|----------|-----------------|--------------|
+| < 1MB | < 10s | 1-3 seconds | ~50MB |
+| 1-5MB | 10-30s | 3-8 seconds | ~100MB |
+| 5-20MB | 30s-2min | 8-20 seconds | ~200MB |
+| 20-50MB | 2-5min | 20-60 seconds | ~400MB |
+
+**Note:** Processing times may vary based on server load and audio complexity.
 
 ---
 
@@ -318,14 +387,24 @@ For API support, feature requests, or bug reports:
 ---
 
 ## Version History
-- **v1.0.0**: Initial release with basic transcription features
-- **v1.1.0**: Added chord detection and improved accuracy
+- **v1.3.0**: Increased file upload limit to 50MB, added OGG support, Railway deployment
 - **v1.2.0**: Added tempo estimation and confidence scores
+- **v1.1.0**: Added chord detection and improved accuracy
+- **v1.0.0**: Initial release with basic transcription features
 
 ---
 
 ## Changelog
-### v1.2.0 (Current)
+### v1.3.0 (Current)
+- **Increased file upload limit to 50MB** (previously 10MB)
+- Added support for OGG audio format
+- Deployed to Railway cloud platform for production use
+- Enhanced error handling and memory management
+- Added `/supported-formats` endpoint
+- Improved processing efficiency for large files
+- Added comprehensive health checks and monitoring
+
+### v1.2.0
 - Added tempo estimation with confidence scoring
 - Improved chord detection accuracy
 - Added support for M4A format

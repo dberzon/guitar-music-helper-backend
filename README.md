@@ -8,24 +8,30 @@ This application serves as a backend API for guitar music transcription, convert
 
 ## 🚀 Features
 
-- **Audio File Upload**: Support for MP3, WAV, M4A, and FLAC formats
+- **Audio File Upload**: Support for MP3, WAV, M4A, FLAC, and OGG formats
+- **Large File Support**: Upload files up to 50MB for comprehensive audio analysis
 - **Note Detection**: Identifies individual notes with timing, pitch, and confidence
 - **Chord Recognition**: Extracts chord progressions from the audio
 - **Tempo Estimation**: Calculates BPM (Beats Per Minute) with confidence
-- **Real-time Processing**: Fast processing with progress tracking
-- **RESTful API**: Clean, documented API endpoints
-- **Error Handling**: Comprehensive error handling and validation
+- **Real-time Processing**: Fast processing with progress tracking and memory optimization
+- **RESTful API**: Clean, documented API endpoints with comprehensive error handling
+- **Production Ready**: Deployed on Railway with automatic scaling and health monitoring
 
 ## 📁 Project Structure
 
 ```
 guitar-music-helper-backend/
-├── main.py                 # FastAPI application entry point
-├── transcription_utils.py  # Audio processing and transcription utilities
-├── models.py              # Pydantic models for data validation
-├── requirements.txt       # Python dependencies
-├── README.md             # This documentation file
-└── .env.example          # Environment variables template
+├── main.py                     # FastAPI application entry point
+├── transcription_utils.py      # Audio processing and transcription utilities
+├── models.py                  # Pydantic models for data validation
+├── requirements.txt           # Python dependencies
+├── .env                      # Environment configuration (local)
+├── .env.example              # Environment variables template
+├── .env.production           # Production environment configuration
+├── .nixpacks.toml            # Railway deployment configuration
+├── Procfile                  # Railway process configuration
+├── RAILWAY_DEPLOYMENT_GUIDE.md # Deployment guide for Railway
+└── README.md                 # This documentation file
 ```
 
 ## 🔧 Installation
@@ -79,50 +85,79 @@ Transcribe an audio file to extract musical information.
 **Request:**
 - **Method**: POST
 - **Content-Type**: multipart/form-data
+- **Max File Size**: 50MB
+- **Supported Formats**: MP3, WAV, M4A, FLAC, OGG
 - **Body**: 
-  - `file`: Audio file (MP3, WAV, M4A, FLAC)
-  - `min_confidence`: Optional, minimum confidence threshold (0.0-1.0, default: 0.5)
+  - `file`: Audio file (required)
 
 **Response:**
 ```json
 {
-  "melody": [
-    {
-      "time": 0.5,
-      "duration": 0.25,
-      "pitch": 64,
-      "frequency": 329.63,
-      "confidence": 0.95
+  "success": true,
+  "data": {
+    "metadata": {
+      "filename": "guitar-sample.mp3",
+      "duration": 180.5,
+      "sampleRate": 22050,
+      "processingTime": 5.2
+    },
+    "melody": [
+      {
+        "time": 0.5,
+        "duration": 0.25,
+        "pitch": 64,
+        "frequency": 329.63,
+        "confidence": 0.95
+      }
+    ],
+    "chords": [
+      {
+        "time": 0.0,
+        "duration": 2.0,
+        "chord": "C major",
+        "confidence": 0.88
+      }
+    ],
+    "tempo": {
+      "bpm": 120.5,
+      "confidence": 0.92
     }
-  ],
-  "chords": [
-    {
-      "time": 0.0,
-      "duration": 2.0,
-      "chord": "Cmaj",
-      "confidence": 0.88
-    }
-  ],
-  "tempo": {
-    "bpm": 120.5,
-    "confidence": 0.92
-  }
+  },
+  "processingTime": 5.2
 }
 ```
 
 #### 2. **GET /health**
-Health check endpoint to verify the service is running.
+Health check endpoint to verify the service is running and dependencies are loaded.
 
 **Response:**
 ```json
 {
   "status": "healthy",
-  "timestamp": "2023-12-07T10:30:00Z"
+  "dependencies_loaded": true,
+  "models_loaded": true,
+  "supported_formats": [".wav", ".mp3", ".m4a", ".flac", ".ogg"],
+  "max_file_size_mb": 50,
+  "timestamp": 1692089400.123
 }
 ```
 
-#### 3. **GET /docs**
+#### 3. **GET /supported-formats**
+Get supported file formats and size limits.
+
+**Response:**
+```json
+{
+  "supportedFormats": [".wav", ".mp3", ".m4a", ".flac", ".ogg"],
+  "maxFileSizeMb": 50
+}
+```
+
+#### 4. **GET /docs**
 Interactive API documentation (Swagger UI)
+
+#### 5. **GET /debug** (Development only)
+Detailed debug information about the server state.
 
 ## 🎵 Data Models
 
@@ -224,17 +259,37 @@ Create a `.env` file with:
 
 ```bash
 # Server Configuration
-HOST=0.0.0.0
-PORT=8000
-DEBUG=false
+ENVIRONMENT=development
+LOG_LEVEL=INFO
+PROCESSING_TIMEOUT=45
 
 # File Upload Limits
 MAX_FILE_SIZE_MB=50
 ALLOWED_EXTENSIONS=.wav,.mp3,.m4a,.flac,.ogg
 
-# Processing Configuration
-DEFAULT_MIN_CONFIDENCE=0.5
-MAX_WORKERS=4
+# Worker Configuration
+MAX_WORKERS=1
+
+# CORS Configuration (for frontend integration)
+CORS_ORIGINS=["http://localhost:3000","http://localhost:5173","http://localhost:5174"]
+BACKEND_URL=http://localhost:8000
+
+# Debug Features
+ENABLE_DEBUG_ENDPOINTS=true
+```
+
+### Production Configuration (Railway)
+For production deployment on Railway, use:
+
+```bash
+# Production Environment
+RAILWAY_ENVIRONMENT=production
+ENVIRONMENT=production
+LOG_LEVEL=WARNING
+MAX_FILE_SIZE_MB=50
+PROCESSING_TIMEOUT=60
+ENABLE_DEBUG_ENDPOINTS=false
+MAX_WORKERS=1
 ```
 
 ## 🧪 Testing
@@ -274,10 +329,32 @@ pytest tests/ -v
 
 ## 📊 Performance Tips
 
-1. **File Size**: Keep audio files under 10MB for faster processing
-2. **Audio Quality**: 44.1kHz, 16-bit is optimal
-3. **Format**: WAV files process faster than compressed formats
-4. **Length**: Shorter clips (under 30 seconds) process much faster
+1. **File Size**: Upload files up to 50MB for comprehensive analysis
+2. **Audio Quality**: 22.05kHz sample rate is optimal for processing speed
+3. **Format**: WAV and FLAC provide best accuracy, MP3 processes faster
+4. **Length**: Files under 3 minutes process most efficiently
+5. **Memory**: Large files (>20MB) may require additional processing time
+
+## 🚀 Deployment
+
+### Railway Deployment
+This application is configured for deployment on Railway:
+
+1. **Connect Repository**: Link your GitHub repository to Railway
+2. **Environment Variables**: Set `MAX_FILE_SIZE_MB=50` in Railway dashboard
+3. **Auto Deploy**: Railway will automatically deploy on git push
+4. **Monitoring**: Use `/health` endpoint for health checks
+
+See `RAILWAY_DEPLOYMENT_GUIDE.md` for detailed deployment instructions.
+
+### Local Development
+```bash
+# Start development server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# With auto-reload for development
+python -m uvicorn main:app --reload
+```
 
 ## 🔒 Security Considerations
 
