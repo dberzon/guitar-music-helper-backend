@@ -128,7 +128,7 @@ curl -X POST "http://localhost:8000/transcribe-status" \
 ```env
 # Core settings
 RAILWAY_ENVIRONMENT=production
-MAX_FILE_SIZE_MB=10
+MAX_FILE_SIZE_MB=50
 PROCESSING_TIMEOUT=45
 
 # Logging

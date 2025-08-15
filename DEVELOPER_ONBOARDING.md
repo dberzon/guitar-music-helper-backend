@@ -46,7 +46,7 @@ Create a `.env` file:
 # Development settings
 RAILWAY_ENVIRONMENT=development
 LOG_LEVEL=DEBUG
-MAX_FILE_SIZE_MB=10
+MAX_FILE_SIZE_MB=50
 PROCESSING_TIMEOUT=45
 
 # CORS settings for local development
@@ -396,7 +396,7 @@ curl https://your-app.railway.app/health
 ```env
 RAILWAY_ENVIRONMENT=production
 LOG_LEVEL=WARNING
-MAX_FILE_SIZE_MB=10
+MAX_FILE_SIZE_MB=50
 PROCESSING_TIMEOUT=60
 ```
 
