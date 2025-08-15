@@ -71,7 +71,7 @@ Create `.env.development`:
 DEBUG=true
 LOG_LEVEL=DEBUG
 MAX_FILE_SIZE_MB=50  # Smaller for development
-ALLOWED_EXTENSIONS=mp3,wav
+ALLOWED_EXTENSIONS=.wav,.mp3,.m4a,.flac,.ogg
 ```
 
 ---

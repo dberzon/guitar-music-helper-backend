@@ -230,7 +230,7 @@ DEBUG=false
 
 # File Upload Limits
 MAX_FILE_SIZE_MB=50
-ALLOWED_EXTENSIONS=mp3,wav,m4a,flac
+ALLOWED_EXTENSIONS=.wav,.mp3,.m4a,.flac,.ogg
 
 # Processing Configuration
 DEFAULT_MIN_CONFIDENCE=0.5
