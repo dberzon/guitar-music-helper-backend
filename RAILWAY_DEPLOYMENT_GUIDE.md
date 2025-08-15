@@ -1,0 +1,75 @@
+# Railway Deployment Guide - 50MB File Upload Fix
+
+## Problem
+The backend was limiting file uploads to 10MB instead of the intended 50MB due to configuration issues.
+
+## Changes Made
+
+### 1. Updated Default Configuration
+- Changed `main.py` line 149 from `Field(10, ...)` to `Field(50, ...)`
+- This ensures the default value is 50MB if environment variables aren't loaded
+
+### 2. Fixed nixpacks.toml
+- Removed incorrect `server/` path references
+- Now correctly references `requirements.txt` and `main:app`
+
+### 3. Updated Environment Configuration
+- Added explicit `ENVIRONMENT=production` to `.env.production`
+- Ensured `MAX_FILE_SIZE_MB=50` is set in production
+
+## Railway Deployment Steps
+
+### Option 1: Environment Variables (Recommended)
+Set these environment variables directly in Railway dashboard:
+```
+MAX_FILE_SIZE_MB=50
+ENVIRONMENT=production
+LOG_LEVEL=WARNING
+PROCESSING_TIMEOUT=60
+ENABLE_DEBUG_ENDPOINTS=false
+```
+
+### Option 2: Deploy with Updated Code
+1. Commit the changes to git:
+   ```bash
+   git add .
+   git commit -m "Fix: Increase file upload limit to 50MB"
+   git push
+   ```
+
+2. Redeploy on Railway (it should auto-deploy if connected to git)
+
+## Verification
+
+After deployment, test the configuration:
+
+```bash
+# Check supported formats endpoint
+curl https://web-production-84b20.up.railway.app/supported-formats
+
+# Should return:
+# {"supportedFormats": [".wav", ".mp3", ".m4a", ".flac", ".ogg"], "maxFileSizeMb": 50}
+```
+
+## Testing File Upload
+
+Try uploading a file between 10-50MB to verify the fix:
+- Files under 50MB should now work
+- Files over 50MB should still be rejected with appropriate error
+
+## Troubleshooting
+
+If still getting 10MB limit:
+1. Check Railway environment variables in dashboard
+2. Check Railway logs for configuration loading messages
+3. Use the `/debug` endpoint to see current config:
+   ```bash
+   curl https://web-production-84b20.up.railway.app/debug
+   ```
+
+## Memory Considerations
+
+Note: 50MB files will require significant memory for processing:
+- Estimated memory usage: ~200MB per file
+- Railway Hobby plan has ~512MB total memory
+- Consider upgrading Railway plan for consistent large file processing

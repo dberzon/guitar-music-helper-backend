@@ -146,7 +146,7 @@ async def temporary_audio_file(file: UploadFile):
 from pydantic_settings import SettingsConfigDict
 
 class Config(BaseSettings):
-    MAX_FILE_SIZE_MB: int = Field(10, description="Max file size in MB - reduced for Railway memory limits")
+    MAX_FILE_SIZE_MB: int = Field(50, description="Max file size in MB - configurable via environment")
     ALLOWED_EXTENSIONS: set[str] = {'.wav', '.mp3', '.m4a', '.flac', '.ogg'}
     MAX_WORKERS: int = 1  # Reduced to prevent memory exhaustion
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")

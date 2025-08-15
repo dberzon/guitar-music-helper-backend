@@ -4,8 +4,8 @@ nixPkgs = ["python310", "python310Packages.pip", "libsndfile", "ffmpeg", "pkg-co
 [phases.install]
 cmds = [
   "pip install --upgrade pip",
-  "pip install -r server/requirements.txt"
+  "pip install -r requirements.txt"
 ]
 
 [start]
-cmd = "python -m uvicorn server.main:app --host 0.0.0.0 --port ${PORT}"
+cmd = "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT}"
