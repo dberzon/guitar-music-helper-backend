@@ -30,8 +30,17 @@ except ImportError:
 
 # Type hints for static analysis even when imports fail
 if TYPE_CHECKING:
+    # Type-only imports for editors; not used at runtime
     from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
     from transcription_utils import process_basic_pitch_output
+
+# Runtime-safe import of the processing helper
+try:
+    from transcription_utils import process_basic_pitch_output  # real implementation
+except Exception:
+    # Minimal no-op fallback to keep the endpoint from crashing during setup
+    def process_basic_pitch_output(model_output, midi_data, note_events, sr, duration):
+        return {"chords": [], "melody": [], "tempo": None}
 
 # --- Types ---
 class ProcessingResult(TypedDict):
@@ -162,7 +171,9 @@ class Config(BaseSettings):
             "http://127.0.0.1:5174",
             "http://localhost:3000",
             "http://127.0.0.1:3000",
-            # Add explicit Vercel production URL
+            # Vercel stable production domain
+            "https://guitar-music-helper.vercel.app",
+            # Example preview domain (keep yours if you use it)
             "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app"
         ],
         description="List of allowed CORS origins"
@@ -396,9 +407,9 @@ def get_metrics_collector(request: Request) -> SimpleMetrics:
     return request.app.state.metrics
 
 def check_dependencies():
-    """Dependency to ensure all required libraries are loaded before processing a request."""
-    if not DEPENDENCIES_LOADED or not MODELS_LOADED:
-        raise DependencyError("Required ML dependencies or local models are not loaded.")
+    """Ensure required ML deps are loaded. Pydantic models are optional since we return plain dicts."""
+    if not DEPENDENCIES_LOADED:
+        raise DependencyError("Required ML dependencies are not loaded.")
 
 def validate_file(file: UploadFile = File(...)) -> UploadFile:
     """
@@ -408,18 +419,7 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
 
-    if file.size is not None and file.size > config.MAX_FILE_SIZE:
-        size_mb = file.size / (1024 * 1024)
-        raise HTTPException(
-            status_code=413, # Payload Too Large
-            detail=f"File is too large ({size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
-        )
-
-    if file.size == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty file provided."
-        )
+    # NOTE: Starlette's UploadFile has no reliable .size; enforce size after saving.
 
     file_extension = Path(file.filename).suffix.lower()
     if file_extension not in config.ALLOWED_EXTENSIONS:
@@ -571,14 +571,76 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
         )
         logger.info("Processing complete, returning results...")
         
-        # Clean up intermediate data
+        # If helper returned no chords, apply a naive, safe fallback from note events
+        def _naive_chords_from_notes(events, total_dur, window=1.0):
+            try:
+                if not events:
+                    return []
+                # bucket by 1s windows, tally pitch classes
+                pc_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+                chords_out = []
+                t = 0.0
+                while t < max(total_dur, 0.001):
+                    t_end = min(t + window, total_dur)
+                    pcs = {}
+                    for ev in events:
+                        # accept multiple shapes (basic-pitch uses onset_time/offset_time)
+                        st = (
+                            getattr(ev, "start_time", None)
+                            or getattr(ev, "onset_time", None)
+                            or (ev.get("start_time") if isinstance(ev, dict) else None)
+                            or (ev.get("onset_time") if isinstance(ev, dict) else None)
+                            or 0.0
+                        )
+                        en = (
+                            getattr(ev, "end_time", None)
+                            or getattr(ev, "offset_time", None)
+                            or (ev.get("end_time") if isinstance(ev, dict) else None)
+                            or (ev.get("offset_time") if isinstance(ev, dict) else None)
+                            or 0.0
+                        )
+                        if st <= (t + t_end) / 2 <= en:
+                            midi = int(
+                                getattr(ev, "midi_note", None)
+                                or getattr(ev, "pitch", None)
+                                or (ev.get("midi_note") if isinstance(ev, dict) else None)
+                                or (ev.get("pitch") if isinstance(ev, dict) else 60)
+                            )
+                            pc = midi % 12
+                            pcs[pc] = pcs.get(pc, 0) + 1
+                    if pcs:
+                        root_pc = max(pcs.items(), key=lambda x: x[1])[0]
+                        # crude maj/min decision
+                        has_m3 = pcs.get((root_pc + 3) % 12, 0)
+                        has_M3 = pcs.get((root_pc + 4) % 12, 0)
+                        has_P5 = pcs.get((root_pc + 7) % 12, 0)
+                        qual = "" if (has_M3 >= has_m3 and has_P5) else "m"
+                        name = pc_names[root_pc] + qual
+                        chords_out.append({"time": float(t), "duration": float(t_end - t), "chord": name})
+                    t = t_end
+                # merge consecutive duplicates
+                merged = []
+                for c in chords_out:
+                    if merged and merged[-1]["chord"] == c["chord"]:
+                        merged[-1]["duration"] += c["duration"]
+                    else:
+                        merged.append(c)
+                return merged
+            except Exception:
+                return []
+
+        chords_list = transcription_data.get("chords", [])
+        if not chords_list:
+            chords_list = _naive_chords_from_notes(note_events, duration)
+
+        # Clean up intermediate data after potential fallback
         del model_output, midi_data, note_events
         gc.collect()
-        
+
         # Return a dictionary with the core results
         return {
             "metadata": {"duration": duration, "sampleRate": sr},
-            "chords": transcription_data.get("chords", []),
+            "chords": chords_list,
             "melody": transcription_data.get("melody", []),
             "tempo": transcription_data.get("tempo"),
         }
@@ -735,11 +797,12 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
     Returns estimated memory requirements and processing feasibility.
     """
     try:
-        file_size_mb = file.size / (1024 * 1024) if file.size else 0
+        # UploadFile.size is not standard; we can't know here without saving.
+        file_size_mb = None
         
         # Estimate memory requirements (rough calculation)
         # Basic-pitch typically needs 3-5x the audio file size in memory
-        estimated_memory_mb = file_size_mb * 4  # Conservative estimate
+        estimated_memory_mb = file_size_mb * 4 if file_size_mb else 50  # Conservative default estimate
         
         # Railway Hobby plan has ~512MB available memory
         railway_memory_limit = 500  # Conservative estimate
@@ -748,7 +811,7 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
             "success": True,
             "file_info": {
                 "filename": file.filename,
-                "size_mb": round(file_size_mb, 2),
+                "size_mb": file_size_mb,  # unknown at this stage
                 "format": Path(file.filename).suffix.lower()
             },
             "memory_analysis": {
@@ -793,26 +856,27 @@ async def transcribe_audio(
     metrics.record_request(endpoint_name)
 
     try:
-        # Check memory before processing
-        file_size_mb = file.size / (1024 * 1024) if file.size else 0
-        estimated_memory = file_size_mb * 4  # Conservative estimate
-        railway_memory_limit = 500  # Conservative estimate for Railway
-        
-        # Warn if close to memory limit
-        if estimated_memory > railway_memory_limit * 0.8:  # 80% threshold
-            logger.warning(f"File {file.filename} is using {estimated_memory:.2f}MB - close to memory limit")
-        
-        if not check_memory_availability(estimated_memory):
-            logger.warning(f"Insufficient memory for file {file.filename} ({file_size_mb:.2f}MB, estimated {estimated_memory:.2f}MB needed)")
-            metrics.record_error(endpoint_name, "insufficient_memory")
-            raise HTTPException(
-                status_code=507,  # Insufficient Storage
-                detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later."
-            )
-
         # Use context manager for automatic file cleanup
         async with temporary_audio_file(file) as tmp_path:
             logger.info(f"File '{file.filename}' saved using context manager. Memory usage: {get_memory_usage():.1f}MB")
+            # Now that we have a file on disk, enforce max size & estimate memory.
+            file_size_bytes = os.path.getsize(tmp_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            if file_size_mb > config.MAX_FILE_SIZE_MB:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File is too large ({file_size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
+                )
+            estimated_memory = file_size_mb * 4  # conservative
+            railway_memory_limit = 500
+            if estimated_memory > railway_memory_limit * 0.8:
+                logger.warning(f"File {file.filename} ~{estimated_memory:.2f}MB est. memory (close to limit)")
+            if not check_memory_availability(estimated_memory):
+                metrics.record_error(endpoint_name, "insufficient_memory")
+                raise HTTPException(
+                    status_code=507,
+                    detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later."
+                )
             
             # Run the blocking, CPU-intensive function in the thread pool with timeout
             executor = request.app.state.executor
@@ -835,22 +899,21 @@ async def transcribe_audio(
             # Record successful processing time using injected metrics
             metrics.record_processing_time(endpoint_name, processing_time)
 
-            # Construct the final Pydantic response model
-            metadata = TranscriptionMetadata(
-                filename=file.filename,
-                processingTime=processing_time,
-                **processing_result_dict["metadata"],
-            )
-            
-            # Handle tempo which might be None
+            # Build a flat response the frontend can consume directly
             tempo_data = processing_result_dict.get("tempo")
-            result = TranscriptionResult(
-                metadata=metadata,
-                chords=processing_result_dict["chords"],
-                melody=processing_result_dict["melody"],
-                tempo=tempo_data
-            )
-            return TranscriptionResponse(success=True, data=result, processingTime=processing_time)
+            response = {
+                "metadata": {
+                    "filename": file.filename,
+                    "processingTime": processing_time,
+                    **processing_result_dict.get("metadata", {}),
+                },
+                "chords": processing_result_dict.get("chords", []),
+                "melody": processing_result_dict.get("melody", []),
+                # accept dict tempo or a single bpm value
+                "tempo": tempo_data if isinstance(tempo_data, dict)
+                         else ({"bpm": tempo_data} if tempo_data else None),
+            }
+            return response
             
         # File automatically cleaned up by context manager
 
