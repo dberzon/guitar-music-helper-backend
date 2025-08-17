@@ -8,6 +8,8 @@ from typing import Dict, TYPE_CHECKING, TypedDict, List, Optional, Union
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+import hashlib
+from contextvars import ContextVar
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +17,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import aiofiles
 from pydantic_settings import BaseSettings
-from pydantic import Field, validator
+from pydantic import Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -122,6 +124,41 @@ class SimpleMetrics:
             "current_memory_usage_mb": get_memory_usage() if PSUTIL_AVAILABLE else None
         }
 
+# --- Simple TTL Cache (no extra dependency) ---
+class SimpleTTLCache:
+    def __init__(self, maxsize: int = 50, ttl: int = 3600):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._data: dict[str, tuple[float, dict]] = {}
+
+    def _evict_if_needed(self):
+        if len(self._data) <= self.maxsize:
+            return
+        # Evict oldest by expiry time
+        oldest_key = min(self._data.keys(), key=lambda k: self._data[k][0])
+        self._data.pop(oldest_key, None)
+
+    def get(self, key: str) -> Optional[dict]:
+        item = self._data.get(key)
+        if not item:
+            return None
+        expires_at, value = item
+        if time.time() > expires_at:
+            self._data.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: str, value: dict):
+        self._data[key] = (time.time() + self.ttl, value)
+        self._evict_if_needed()
+
+def get_file_hash(file_path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
 # --- File Management Utilities ---
 @asynccontextmanager
 async def temporary_audio_file(file: UploadFile):
@@ -136,8 +173,12 @@ async def temporary_audio_file(file: UploadFile):
         # Stream file content efficiently
         await file.seek(0)
         async with aiofiles.open(tmp_path, 'wb') as out_file:
-            while content := await file.read(1024 * 1024):  # 1MB chunks
-                await out_file.write(content)
+            total = 0
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                total += len(chunk)
+                if total > (config.MAX_FILE_SIZE + 1024 * 1024):
+                    raise HTTPException(status_code=413, detail="File too large.")
+                await out_file.write(chunk)
                 
         logger.debug(f"Temporary file created: {tmp_path}")
         yield tmp_path
@@ -161,6 +202,9 @@ class Config(BaseSettings):
     ENVIRONMENT: str = Field("development", env="RAILWAY_ENVIRONMENT")
     LOG_LEVEL: str = "INFO"
     PROCESSING_TIMEOUT: int = Field(45, description="Max processing time in seconds - increased for Railway")
+    # Cache
+    CACHE_TTL_SECONDS: int = Field(3600, description="Seconds to cache identical-file results")
+    CACHE_MAX_ITEMS: int = Field(50, description="Max cached entries")
     
     # Dynamic CORS configuration based on environment
     CORS_ORIGINS: list[str] = Field(
@@ -215,13 +259,18 @@ class Config(BaseSettings):
         """Check if running in production mode"""
         return self.ENVIRONMENT.lower() in ["production", "prod"]
 
-    @validator('MAX_FILE_SIZE_MB')
+    @property
+    def cache_enabled(self) -> bool:
+        """Enable caching only in production by default"""
+        return self.is_production
+
+    @field_validator('MAX_FILE_SIZE_MB')
     def validate_max_file_size(cls, v):
         if v < 1 or v > 100:
             raise ValueError('MAX_FILE_SIZE_MB must be between 1 and 100')
         return v
     
-    @validator('PROCESSING_TIMEOUT')
+    @field_validator('PROCESSING_TIMEOUT')
     def validate_timeout(cls, v):
         if v < 10 or v > 300:
             raise ValueError('PROCESSING_TIMEOUT must be between 10 and 300 seconds')
@@ -233,8 +282,27 @@ config = Config()
 limiter = Limiter(key_func=get_remote_address)
 
 # Configure logging using the config LOG_LEVEL
-logging.basicConfig(level=config.LOG_LEVEL.upper())
+request_context: ContextVar[dict] = ContextVar("request_context", default={})
+
+logging.basicConfig(
+    level=config.LOG_LEVEL.upper(),
+    format="%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s"
+)
+
+class ContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        ctx = request_context.get({})
+        record.request_id = ctx.get("request_id", "no-req")
+        return True
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(ContextFilter())
 logger = logging.getLogger(__name__)
+
+def require_debug_enabled():
+    """Return 404 when debug endpoints are disabled or we're in production."""
+    if not config.ENABLE_DEBUG_ENDPOINTS or config.is_production:
+        raise HTTPException(status_code=404, detail="Not found")
 
 # --- Application Configuration ---
 
@@ -261,13 +329,28 @@ class AudioProcessingError(Exception):
 class DependencyError(Exception):
     """Custom exception for when a required dependency is not available."""
     pass
+
+class ProcessingTimeoutError(AudioProcessingError):
+    """Raised when processing exceeds the configured timeout."""
+    pass
+
+class InsufficientMemoryError(AudioProcessingError):
+    """Raised when available memory is insufficient."""
+    pass
+
+class AudioFormatError(AudioProcessingError):
+    """Raised when the audio format is invalid or corrupted."""
+    pass
+
+class ModelInferenceError(AudioProcessingError):
+    """Raised when the ML model fails during inference."""
+    pass
 # --- Dependency Loading with Graceful Failure ---
 # Try to import heavy ML dependencies. If they fail, the app can still start,
 # but the transcription endpoint will be disabled via dependency checks.
 try:
     import librosa
     import numpy as np
-    from basic_pitch import ICASSP_2022_MODEL_PATH
     from basic_pitch.inference import predict
     DEPENDENCIES_LOADED = True
     logger.info("All ML dependencies loaded successfully.")
@@ -281,8 +364,6 @@ except ImportError as e:
 try:
     # These are assumed to be Pydantic models in a local `models.py` file.
     from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
-    # This is assumed to be a processing function in `transcription_utils.py`.
-    from transcription_utils import process_basic_pitch_output
     MODELS_LOADED = True
     logger.info("Local models and utilities loaded successfully.")
 except ImportError as e:
@@ -306,6 +387,21 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Initialize metrics collection
 app.state.metrics = SimpleMetrics()
+app.state.cache = SimpleTTLCache(maxsize=config.CACHE_MAX_ITEMS, ttl=config.CACHE_TTL_SECONDS)
+
+# --- Request Size Limit Middleware ---
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            size = int(cl)
+            # allow ~1MB form overhead
+            if size > (config.MAX_FILE_SIZE + 1024 * 1024):
+                return JSONResponse(status_code=413, content={"error": "Request too large"})
+        except ValueError:
+            pass
+    return await call_next(request)
 
 # --- Request ID Middleware ---
 @app.middleware("http")
@@ -313,8 +409,16 @@ async def add_request_id(request: Request, call_next):
     """Add unique request ID for tracing"""
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
-    
-    response = await call_next(request)
+    token = request_context.set({
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "client_ip": get_remote_address(request)
+    })
+    try:
+        response = await call_next(request)
+    finally:
+        request_context.reset(token)
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -329,6 +433,8 @@ app.add_middleware(
     allow_credentials=True,  # Can be True now that we don't use "*"
     allow_methods=["GET", "POST", "OPTIONS"],  # Be specific about allowed methods
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
+    max_age=600,
 )
 
 # --- Exception Handlers ---
@@ -370,13 +476,16 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
     """Handles errors specific to the audio processing pipeline."""
     request_id = getattr(request.state, 'request_id', None)
     logger.warning(f"Audio processing error for request {request.url} (ID: {request_id}): {exc}")
+    # Map timeouts to a more appropriate HTTP status
+    status_code = 504 if isinstance(exc, ProcessingTimeoutError) else 422
+    code = "TIMEOUT" if isinstance(exc, ProcessingTimeoutError) else "AUDIO_PROCESSING_ERROR"
     return JSONResponse(
-        status_code=422,  # Unprocessable Entity
+        status_code=status_code,
         content={
             "success": False,
             "error": {
-                "code": "AUDIO_PROCESSING_ERROR",
-                "message": "Failed to process the provided audio file.",
+                "code": code,
+                "message": "Processing timed out." if status_code == 504 else "Failed to process the provided audio file.",
                 "details": str(exc),
                 "request_id": request_id
             },
@@ -421,7 +530,18 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
 
     # NOTE: Starlette's UploadFile has no reliable .size; enforce size after saving.
 
-    file_extension = Path(file.filename).suffix.lower()
+    # Sanitize filename (strip any path) and block dotfiles & double extensions
+    safe_name = Path(file.filename).name
+    if not safe_name or safe_name.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    if safe_name.count(".") > 1:
+        # Allow benign multi-dot names, block suspicious inner extensions
+        dangerous = {"exe","js","php","sh","bat","cmd","com","scr"}
+        inner_parts = [p.lower() for p in safe_name.split(".")[:-1]]
+        if any(p in dangerous for p in inner_parts):
+            raise HTTPException(status_code=400, detail="Suspicious multi-extension filename.")
+
+    file_extension = Path(safe_name).suffix.lower()
     if file_extension not in config.ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=415,  # Unsupported Media Type
@@ -438,12 +558,22 @@ def validate_file(file: UploadFile = File(...)) -> UploadFile:
     
     return file
 
+def validate_audio_content(tmp_path: str) -> bool:
+    """Optional content sniff (best-effort). Returns True if looks like audio."""
+    try:
+        import magic  # python-magic; optional, will skip if missing
+        mime = magic.from_file(tmp_path, mime=True)
+        return bool(mime and mime.startswith("audio/"))
+    except Exception:
+        # If magic is unavailable or errors, don't block
+        return True
+
 @app.get("/", summary="API Root", tags=["Status"])
 async def root():
     """Provides basic service information and status."""
     return {
         "service": "Guitar Music Helper Audio Transcription API",
-        "version": "1.0.0",
+        "version": app.version,
         "status": "healthy" if DEPENDENCIES_LOADED and MODELS_LOADED else "degraded",
         "environment": config.ENVIRONMENT,
         "backend_url": config.BACKEND_URL,
@@ -464,14 +594,25 @@ async def environment_info():
 @app.get("/health", summary="Health Check", tags=["Status"])
 async def health_check():
     """Performs a detailed health check of the service and its dependencies."""
-    return {
-        "status": "healthy" if DEPENDENCIES_LOADED and MODELS_LOADED else "degraded",
-        "dependencies_loaded": DEPENDENCIES_LOADED,
-        "models_loaded": MODELS_LOADED,
-        "supported_formats": list(config.ALLOWED_EXTENSIONS),
-        "max_file_size_mb": config.MAX_FILE_SIZE_MB,
-        "timestamp": time.time(),
-    }
+    try:
+        return {
+            "status": "healthy" if DEPENDENCIES_LOADED and MODELS_LOADED else "degraded",
+            "dependencies_loaded": DEPENDENCIES_LOADED,
+            "models_loaded": MODELS_LOADED,
+            "supported_formats": list(config.ALLOWED_EXTENSIONS) if config.ALLOWED_EXTENSIONS else [],
+            "max_file_size_mb": config.MAX_FILE_SIZE_MB if config.MAX_FILE_SIZE_MB is not None else 0,
+            "timestamp": time.time(),
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/health/live", summary="Liveness Probe", tags=["Status"])
+async def liveness_probe():
+    return {"status": "alive"}
+
+@app.get("/health/ready", summary="Readiness Probe", tags=["Status"])
+async def readiness_probe():
+    return {"status": "ready" if DEPENDENCIES_LOADED else "not ready"}
 
 @app.get("/health/detailed", summary="Detailed Health Check", tags=["Status"])
 async def detailed_health_check():
@@ -661,6 +802,8 @@ async def test_minimal_processing(request: Request, file: UploadFile = Depends(v
     """
     Test minimal audio processing to identify where exactly the failure occurs.
     """
+    require_debug_enabled()
+    
     start_time = time.time()
     tmp_path = None
     
@@ -743,6 +886,8 @@ async def test_dependencies(request: Request):
     """
     Test if ML dependencies can be imported and used without file processing.
     """
+    require_debug_enabled()
+    
     try:
         if not DEPENDENCIES_LOADED:
             return {"success": False, "error": "Dependencies not loaded"}
@@ -797,12 +942,20 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
     Returns estimated memory requirements and processing feasibility.
     """
     try:
-        # UploadFile.size is not standard; we can't know here without saving.
+        # Roughly infer file size from Content-Length (multipart adds overhead)
         file_size_mb = None
-        
-        # Estimate memory requirements (rough calculation)
-        # Basic-pitch typically needs 3-5x the audio file size in memory
-        estimated_memory_mb = file_size_mb * 4 if file_size_mb else 50  # Conservative default estimate
+        cl = request.headers.get("content-length")
+        if cl:
+            try:
+                content_len = int(cl)
+                # subtract ~256KB to offset multipart form overhead (heuristic)
+                approx_bytes = max(0, content_len - 256 * 1024)
+                file_size_mb = approx_bytes / (1024 * 1024)
+            except ValueError:
+                pass
+
+        # Basic-pitch typically needs 3–5× the audio size; use 4× as a conservative middle
+        estimated_memory_mb = (file_size_mb * 4) if file_size_mb is not None else 50
         
         # Railway Hobby plan has ~512MB available memory
         railway_memory_limit = 500  # Conservative estimate
@@ -811,7 +964,7 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
             "success": True,
             "file_info": {
                 "filename": file.filename,
-                "size_mb": file_size_mb,  # unknown at this stage
+                "size_mb": round(file_size_mb, 2) if file_size_mb is not None else None,
                 "format": Path(file.filename).suffix.lower()
             },
             "memory_analysis": {
@@ -867,6 +1020,9 @@ async def transcribe_audio(
                     status_code=413,
                     detail=f"File is too large ({file_size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
                 )
+            # Optional content sniff (best effort)
+            if not validate_audio_content(tmp_path):
+                raise HTTPException(status_code=415, detail="Uploaded file does not appear to be an audio file.")
             estimated_memory = file_size_mb * 4  # conservative
             railway_memory_limit = 500
             if estimated_memory > railway_memory_limit * 0.8:
@@ -878,9 +1034,18 @@ async def transcribe_audio(
                     detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later."
                 )
             
+            # Cache check (same file re-uploaded)
+            if config.cache_enabled:
+                fhash = get_file_hash(tmp_path)
+                cached = request.app.state.cache.get(fhash)
+                if cached:
+                    logger.info(f"Returning cached result for '{file.filename}'")
+                    metrics.record_processing_time(endpoint_name, 0.0)
+                    return cached
+
             # Run the blocking, CPU-intensive function in the thread pool with timeout
             executor = request.app.state.executor
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             # Add timeout to prevent Railway from timing out
             try:
@@ -891,7 +1056,7 @@ async def transcribe_audio(
             except asyncio.TimeoutError:
                 logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
                 metrics.record_error(endpoint_name, "timeout")
-                raise AudioProcessingError(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds. Try uploading a smaller file.")
+                raise ProcessingTimeoutError(f"Timed out after {config.PROCESSING_TIMEOUT}s")
             
             processing_time = time.time() - start_time
             logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s. Final memory usage: {get_memory_usage():.1f}MB")
@@ -913,6 +1078,13 @@ async def transcribe_audio(
                 "tempo": tempo_data if isinstance(tempo_data, dict)
                          else ({"bpm": tempo_data} if tempo_data else None),
             }
+            
+            # Cache store
+            if config.cache_enabled:
+                try:
+                    request.app.state.cache.set(fhash, response)
+                except Exception:
+                    pass
             return response
             
         # File automatically cleaned up by context manager
@@ -949,6 +1121,8 @@ async def test_upload(request: Request, file: UploadFile = Depends(validate_file
     Test endpoint that accepts a file upload but doesn't process it.
     Used to test if the issue is with file upload or audio processing.
     """
+    require_debug_enabled()
+    
     start_time = time.time()
     tmp_path = None
 
@@ -989,6 +1163,7 @@ async def test_upload(request: Request, file: UploadFile = Depends(validate_file
 @app.get("/debug", summary="Debug Information", tags=["Status"])
 async def debug_info():
     """Returns detailed debug information about the server state."""
+    require_debug_enabled()
     import sys
     import platform
     
@@ -1062,4 +1237,6 @@ async def get_rate_limits():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     # In a real production setup, you would use a process manager like Gunicorn or Uvicorn's --workers flag.
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level=logging.getLogger().level)
+    # Map numeric logging level to the string uvicorn expects (e.g., "info").
+    _level_name = logging.getLevelName(logging.getLogger().level)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level=str(_level_name).lower())
