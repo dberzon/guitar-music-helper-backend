@@ -13,6 +13,8 @@ from contextvars import ContextVar
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import importlib.util as _importlib_util
+from shutil import which as _which
 
 # --- New: Background jobs + YouTube support ---
 from redis import Redis
@@ -27,6 +29,7 @@ from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.errors import RateLimitExceeded
 
 # Memory monitoring
@@ -244,7 +247,7 @@ class Config(BaseSettings):
     
     # Development mode settings
     ENABLE_DEBUG_ENDPOINTS: bool = Field(
-        default=True,
+        default=False,
         description="Enable debug endpoints in development"
     )
 
@@ -451,32 +454,90 @@ except Exception as _e:
 @limiter.limit("3/minute")
 async def transcribe_youtube(request: Request, payload: YouTubeJob):
     if not job_queue:
-        raise HTTPException(status_code=503, detail="Background queue not available")
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Background queue not available"})
+    # Ensure URL sanity
     if not is_youtube_url(payload.url):
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid YouTube URL"})
+
+    # Dependencies check
+    missing = _check_youtube_dependencies()
+    if missing:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Missing system dependencies", "details": missing})
+
     job = job_queue.enqueue(process_youtube_job, payload.url)
-    return {"job_id": job.get_id()}
+    return JSONResponse(status_code=202, content={"ok": True, "job_id": job.get_id()})
+
+# Alias to support existing frontend integrations: /transcribe/youtube
+@app.post("/transcribe/youtube", summary="(alias) Submit a YouTube URL", tags=["Transcription"])
+@limiter.limit("3/minute")
+async def transcribe_youtube_alias(request: Request, payload: YouTubeJob):
+    return await transcribe_youtube(request, payload)
 
 
 @app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
 @limiter.limit("10/minute")
-async def job_status(job_id: str):
+async def job_status(request: Request, job_id: str):
     if not redis_conn:
-        raise HTTPException(status_code=503, detail="Queue not available")
+        return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
     try:
         from rq.job import Job
         job = Job.fetch(job_id, connection=redis_conn)
     except Exception:
-        raise HTTPException(status_code=404, detail="Unknown job id")
+        return JSONResponse(status_code=404, content={"job_id": job_id, "status": "not_found", "finished": False, "result": None, "error": "Unknown job id"})
+    return JSONResponse(status_code=200, content=_job_payload(job, include_result=False))
+
+# Alias endpoint that returns the result directly when finished (common in UIs)
+@app.get("/jobs/{job_id}/result", summary="Get finished job result", tags=["Transcription"])
+@limiter.limit("10/minute")
+async def job_result(request: Request, job_id: str):
+    if not redis_conn:
+        return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
+    try:
+        from rq.job import Job
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        return JSONResponse(status_code=404, content={"job_id": job_id, "status": "not_found", "finished": False, "result": None, "error": "Unknown job id"})
+    payload = _job_payload(job, include_result=True)
     if job.is_finished:
-        return {"status": "finished", "result": job.result}
+        return JSONResponse(status_code=200, content=payload)
     if job.is_failed:
-        return {"status": "failed", "error": str(job.exc_info or "Job failed")}
-    return {"status": "queued" if job.is_queued else "started"}
+        return JSONResponse(status_code=500, content=payload)
+    return JSONResponse(status_code=202, content=payload)
 
 # Configure rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# -----------------------------
+# Helpers: deps + job formatting
+# -----------------------------
+def _check_youtube_dependencies() -> list[str]:
+    """Return a list of missing tools required for YouTube transcription."""
+    missing: list[str] = []
+    if _which("ffmpeg") is None:
+        missing.append("ffmpeg is not installed or not on PATH. Install ffmpeg in the Docker image.")
+    if _importlib_util.find_spec("yt_dlp") is None:
+        missing.append("Python package 'yt-dlp' is missing. Add it to requirements.txt (e.g. yt-dlp==2025.6.30).")
+    return missing
+
+def _job_payload(job, include_result: bool = True) -> dict:
+    """Consistent JSON shape for job status/results."""
+    status = (
+        "finished" if job.is_finished else
+        "failed" if job.is_failed else
+        "started" if getattr(job, "is_started", False) else
+        "queued" if job.is_queued else
+        "deferred" if getattr(job, "is_deferred", False) else
+        "unknown"
+    )
+    return {
+        "job_id": job.get_id(),
+        "status": status,
+        "finished": job.is_finished,
+        "result": (job.result if (include_result and job.is_finished) else None),
+        "error": (str(job.exc_info) if job.is_failed else None),
+    }
 
 # Initialize metrics collection
 app.state.metrics = SimpleMetrics()
