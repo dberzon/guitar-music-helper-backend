@@ -127,20 +127,19 @@ def process_basic_pitch_output(model_output: Dict[str, Any],
 
 def convert_to_transcription_format(basic_pitch_output: Dict[str, Any], 
                                   audio_path: str) -> Dict[str, Any]:
-    """Convert basic-pitch output to our transcription format."""
-    # This is a placeholder for more complex conversion logic
-    # In practice, we'd use the process_basic_pitch_output function
-    
-    audio, sr = librosa.load(audio_path, sr=None, mono=True)
-    duration = len(audio) / sr
-    
-    # Estimate tempo
-    tempo_bpm, tempo_conf = estimate_tempo(audio, sr)
-    
+    """Convert basic-pitch output to our transcription format.
+    Loads audio at sr=22050 mono to align with the processing pipeline.
+    """
+    audio, sr = librosa.load(audio_path, sr=22050, mono=True)
+    if audio.size == 0:
+        tempo_bpm, tempo_conf = 120.0, 0.0
+    else:
+        audio = np.asarray(audio, dtype=np.float32, order="C")
+        tempo_bpm, tempo_conf = estimate_tempo(audio, sr)
     return {
         "melody": [],
         "chords": [],
-        "tempo": TranscriptionTempo(bpm=tempo_bpm, confidence=tempo_conf)
+        "tempo": {"bpm": float(tempo_bpm), "confidence": float(tempo_conf)},
     }
 
 

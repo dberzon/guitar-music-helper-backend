@@ -6,7 +6,6 @@ import logging
 import uuid
 from typing import Dict, TYPE_CHECKING, TypedDict, List, Optional, Union
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import hashlib
 from contextvars import ContextVar
@@ -14,6 +13,14 @@ from contextvars import ContextVar
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# --- New: Background jobs + YouTube support ---
+from redis import Redis
+from rq import Queue
+from pydantic import BaseModel
+import yt_dlp
+import subprocess
+import re
 import uvicorn
 import aiofiles
 from pydantic_settings import BaseSettings
@@ -205,6 +212,8 @@ class Config(BaseSettings):
     # Cache
     CACHE_TTL_SECONDS: int = Field(3600, description="Seconds to cache identical-file results")
     CACHE_MAX_ITEMS: int = Field(50, description="Max cached entries")
+    # YouTube safety guard
+    MAX_YOUTUBE_DURATION_SEC: int = Field(15 * 60, description="Reject YouTube videos longer than this (seconds)")
     
     # Dynamic CORS configuration based on environment
     CORS_ORIGINS: list[str] = Field(
@@ -278,8 +287,40 @@ class Config(BaseSettings):
 
 config = Config()
 
+# --- Error types and dependency flags (minimal definitions) ---
+class AudioProcessingError(Exception):
+    pass
+
+class DependencyError(Exception):
+    pass
+
+class ProcessingTimeoutError(AudioProcessingError):
+    pass
+
+# Runtime flags indicating optional ML dependencies and models
+DEPENDENCIES_LOADED = False
+MODELS_LOADED = False
+
+# Attempt to import optional ML dependencies to set runtime flags
+try:
+    import librosa  # type: ignore
+    import numpy as np  # type: ignore
+    from basic_pitch.inference import predict  # type: ignore
+    DEPENDENCIES_LOADED = True
+    MODELS_LOADED = True
+except Exception:
+    DEPENDENCIES_LOADED = False
+    MODELS_LOADED = False
+
+
+def require_debug_enabled():
+    """Raise 404 if debug endpoints are disabled in configuration."""
+    if not config.ENABLE_DEBUG_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
 # Initialize rate limiter - limits requests based on client IP address
 limiter = Limiter(key_func=get_remote_address)
+ 
 
 # Configure logging using the config LOG_LEVEL
 request_context: ContextVar[dict] = ContextVar("request_context", default={})
@@ -299,87 +340,139 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(ContextFilter())
 logger = logging.getLogger(__name__)
 
-def require_debug_enabled():
-    """Return 404 when debug endpoints are disabled or we're in production."""
-    if not config.ENABLE_DEBUG_ENDPOINTS or config.is_production:
-        raise HTTPException(status_code=404, detail="Not found")
+YOUTUBE_REGEX = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/'
 
-# --- Application Configuration ---
+def is_youtube_url(u: str) -> bool:
+    return re.match(YOUTUBE_REGEX, u or "", flags=re.IGNORECASE) is not None
 
-# --- Lifespan Context Manager ---
+def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
+    """Download YouTube audio with yt-dlp and convert to mono 22.05kHz WAV using ffmpeg."""
+    out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": out_tmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "socket_timeout": 30,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "0"}
+        ],
+        "postprocessor_args": ["-ar", "22050", "-ac", "1"],
+        "prefer_ffmpeg": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # First probe (no download) to enforce duration/livestream checks
+        info = ydl.extract_info(url, download=False)
+        dur = int(info.get("duration") or 0)
+        if info.get("is_live"):
+            raise ValueError("Livestreams are not supported.")
+        if dur and dur > config.MAX_YOUTUBE_DURATION_SEC:
+            raise ValueError(f"Video too long: {dur}s exceeds limit of {config.MAX_YOUTUBE_DURATION_SEC}s")
+        # Download after passing checks
+        info = ydl.extract_info(url, download=True)
+        vid = info.get("id")
+        wav_path = os.path.join(tmp_dir, f"{vid}.wav")
+        if not os.path.exists(wav_path):
+            # Fallback if postprocessor did not emit wav
+            in_file = ydl.prepare_filename(info)
+            subprocess.run(["ffmpeg", "-y", "-i", in_file, "-ar", "22050", "-ac", "1", wav_path], check=True)
+        return wav_path, info
+
+def process_youtube_job(url: str) -> dict:
+    tmp_dir = tempfile.mkdtemp(prefix="yt_")
+    try:
+        audio_path, info = yt_download_to_wav(tmp_dir, url)
+        result = process_audio_file_sync(audio_path)
+        tempo = result.get("tempo")
+        return {
+            "metadata": {
+                "filename": f"{info.get('id')}.wav",
+                "processingTime": result.get("metadata", {}).get("processingTime"),
+                **result.get("metadata", {}),
+                "source": "youtube",
+                "videoId": info.get("id"),
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "webpage_url": info.get("webpage_url"),
+            },
+            "chords": result.get("chords", []),
+            "melody": result.get("melody", []),
+            "tempo": tempo if isinstance(tempo, dict) else ({"bpm": tempo} if tempo else None),
+        }
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+class YouTubeJob(BaseModel):
+    url: str
+# --- FastAPI app and lifespan ---
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifespan - startup and shutdown events."""
-    # Startup
+    # Create a thread pool executor for blocking work
+    from concurrent.futures import ThreadPoolExecutor
     app.state.executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
-    logger.info(f"ThreadPoolExecutor started with {config.MAX_WORKERS} workers")
     yield
-    # Shutdown
-    app.state.executor.shutdown(wait=True)
-    logger.info("ThreadPoolExecutor shutdown complete")
+    # Cleanup executor on shutdown
+    try:
+        app.state.executor.shutdown(wait=False)
+    except Exception:
+        pass
 
-# --- Thread Pool for CPU-intensive Tasks ---
-# Note: executor is now managed via lifespan context and accessed via app.state.executor
 
-# --- Custom Exceptions ---
-class AudioProcessingError(Exception):
-    """Custom exception for errors during the audio processing pipeline."""
-    pass
-
-class DependencyError(Exception):
-    """Custom exception for when a required dependency is not available."""
-    pass
-
-class ProcessingTimeoutError(AudioProcessingError):
-    """Raised when processing exceeds the configured timeout."""
-    pass
-
-class InsufficientMemoryError(AudioProcessingError):
-    """Raised when available memory is insufficient."""
-    pass
-
-class AudioFormatError(AudioProcessingError):
-    """Raised when the audio format is invalid or corrupted."""
-    pass
-
-class ModelInferenceError(AudioProcessingError):
-    """Raised when the ML model fails during inference."""
-    pass
-# --- Dependency Loading with Graceful Failure ---
-# Try to import heavy ML dependencies. If they fail, the app can still start,
-# but the transcription endpoint will be disabled via dependency checks.
-try:
-    import librosa
-    import numpy as np
-    from basic_pitch.inference import predict
-    DEPENDENCIES_LOADED = True
-    logger.info("All ML dependencies loaded successfully.")
-except ImportError as e:
-    logger.warning(f"Could not load ML dependencies. Transcription will be unavailable. Error: {e}")
-    DEPENDENCIES_LOADED = False
-    # Define dummy values to prevent runtime errors on startup
-    librosa, np, predict = None, None, None
-
-# Try to import local models and utilities.
-try:
-    # These are assumed to be Pydantic models in a local `models.py` file.
-    from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
-    MODELS_LOADED = True
-    logger.info("Local models and utilities loaded successfully.")
-except ImportError as e:
-    logger.warning(f"Could not load local models/utils. Using dummy structures. Error: {e}")
-    MODELS_LOADED = False
-    # No need to define dummy structures - TYPE_CHECKING provides types for IDEs
-
-# --- FastAPI Application Setup ---
 app = FastAPI(
-    title="Guitar Music Helper - Audio Transcription API",
-    description="An AI-powered API to transcribe guitar audio into notes and chords using basic-pitch. Now supporting files up to 50MB.",
-    version="1.3.0",
+    title="Guitar Music Helper Backend",
+    description="Audio transcription API for guitar music helper",
+    version="1.0.0",
     docs_url="/docs" if config.is_development else None,
     redoc_url="/redoc" if config.is_development else None,
     lifespan=lifespan,
 )
+
+# Initialize Redis/RQ queue for background audio jobs (optional)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+try:
+    redis_conn = Redis.from_url(REDIS_URL)
+    job_queue = Queue("gmh-audio", connection=redis_conn)
+    logger.info("RQ connected and queue ready.")
+except Exception as _e:
+    redis_conn = None
+    job_queue = None
+    logger.warning(f"RQ/Redis not available: {_e}")
+
+
+
+@app.post("/transcribe-youtube", summary="Submit a YouTube URL for background transcription", tags=["Transcription"])
+@limiter.limit("3/minute")
+async def transcribe_youtube(request: Request, payload: YouTubeJob):
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Background queue not available")
+    if not is_youtube_url(payload.url):
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+    job = job_queue.enqueue(process_youtube_job, payload.url)
+    return {"job_id": job.get_id()}
+
+
+@app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
+@limiter.limit("10/minute")
+async def job_status(job_id: str):
+    if not redis_conn:
+        raise HTTPException(status_code=503, detail="Queue not available")
+    try:
+        from rq.job import Job
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Unknown job id")
+    if job.is_finished:
+        return {"status": "finished", "result": job.result}
+    if job.is_failed:
+        return {"status": "failed", "error": str(job.exc_info or "Job failed")}
+    return {"status": "queued" if job.is_queued else "started"}
 
 # Configure rate limiting
 app.state.limiter = limiter
