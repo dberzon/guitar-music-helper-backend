@@ -25,6 +25,7 @@ import subprocess
 import re
 import uvicorn
 import aiofiles
+import requests
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -412,6 +413,81 @@ def process_youtube_job(url: str) -> dict:
 
 class YouTubeJob(BaseModel):
     url: str
+
+# -------------------------------
+# Direct URL transcription (BG job)
+# -------------------------------
+class DirectURLJob(BaseModel):
+    url: str
+
+_HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50 MB hard cap for direct URL ingestion
+
+def _is_http_url(u: Optional[str]) -> bool:
+    return bool(u and _HTTP_URL_RE.match(u))
+
+def _sanitize_filename(name: str) -> str:
+    # Keep it simple: strip path bits and replace suspicious chars
+    base = os.path.basename(name or "")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", base) or "remote_audio"
+
+def _download_to_wav(tmp_dir: str, url: str) -> str:
+    """
+    Stream-download the remote file with a size cap, then normalize to 22.05kHz mono WAV.
+    Returns absolute path to the WAV file.
+    """
+    raw_path = os.path.join(tmp_dir, "in.bin")
+    wav_path = os.path.join(tmp_dir, "in.wav")
+
+    with requests.get(url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        total = 0
+        with open(raw_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("Remote file exceeds size limit (50 MB).")
+                f.write(chunk)
+
+    # Normalize via ffmpeg → 22.05kHz mono WAV
+    # You can tweak the sample rate/channels to match your pipeline defaults.
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_path, "-ar", "22050", "-ac", "1", wav_path],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return wav_path
+
+def _process_direct_url_job(url: str) -> dict:
+    """
+    Background worker entrypoint. Mirrors the shape returned by /transcribe (file upload).
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="url_")
+    try:
+        audio_path = _download_to_wav(tmp_dir, url)
+        result = process_audio_file_sync(audio_path)  # <-- your existing sync processor
+        tempo = result.get("tempo")
+        # Try to derive a nice filename from the URL path
+        filename = _sanitize_filename(Path(url).name)
+        return {
+            "metadata": {
+                "filename": filename,
+                **result.get("metadata", {}),
+            },
+            "chords": result.get("chords", []),
+            "melody": result.get("melody", []),
+            "tempo": tempo if isinstance(tempo, dict) else ({"bpm": tempo} if tempo else None),
+        }
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 # --- FastAPI app and lifespan ---
 
 
@@ -472,6 +548,21 @@ async def transcribe_youtube(request: Request, payload: YouTubeJob):
 @limiter.limit("3/minute")
 async def transcribe_youtube_alias(request: Request, payload: YouTubeJob):
     return await transcribe_youtube(request, payload)
+
+
+@app.post("/transcribe-url", summary="Submit a direct audio URL for background transcription", tags=["Transcription"])
+@limiter.limit("3/minute")
+async def transcribe_url(request: Request, payload: DirectURLJob):
+    if not job_queue:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Background queue not available"})
+    if not _is_http_url(payload.url):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid or non-HTTP URL"})
+    try:
+        # Enqueue a background job; worker must be running: rq worker -u "$REDIS_URL" gmh-audio
+        job = job_queue.enqueue(_process_direct_url_job, payload.url)
+        return JSONResponse(status_code=202, content={"ok": True, "job_id": job.get_id()})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
