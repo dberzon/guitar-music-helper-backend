@@ -324,6 +324,10 @@ def require_debug_enabled():
 
 # Initialize rate limiter - limits requests based on client IP address
 limiter = Limiter(key_func=get_remote_address)
+
+def job_rate_key(request: Request):
+    """Custom rate limiting key that combines IP address with job ID for per-job rate limiting"""
+    return f"{get_remote_address(request)}:{request.path_params.get('job_id','')}"
  
 
 # Configure logging using the config LOG_LEVEL
@@ -566,7 +570,7 @@ async def transcribe_url(request: Request, payload: DirectURLJob):
 
 
 @app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
-@limiter.limit("10/minute")
+@limiter.limit("60/minute", key_func=job_rate_key)
 async def job_status(request: Request, job_id: str):
     if not redis_conn:
         return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
@@ -579,7 +583,7 @@ async def job_status(request: Request, job_id: str):
 
 # Alias endpoint that returns the result directly when finished (common in UIs)
 @app.get("/jobs/{job_id}/result", summary="Get finished job result", tags=["Transcription"])
-@limiter.limit("10/minute")
+@limiter.limit("60/minute", key_func=job_rate_key)
 async def job_result(request: Request, job_id: str):
     if not redis_conn:
         return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
