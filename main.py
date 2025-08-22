@@ -354,37 +354,65 @@ def is_youtube_url(u: str) -> bool:
     return re.match(YOUTUBE_REGEX, u or "", flags=re.IGNORECASE) is not None
 
 def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
-    """Download YouTube audio with yt-dlp and convert to mono 22.05kHz WAV using ffmpeg."""
+    """Download YT audio with yt-dlp → mono 22.05kHz WAV (ffmpeg). Hardened for cloud IPs."""
     out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-    ydl_opts = {
+    base_opts = {
         "format": "bestaudio/best",
         "outtmpl": out_tmpl,
         "noplaylist": True,
         "quiet": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 1,
         "socket_timeout": 30,
+        "forceipv4": True,               # some CDNs reject IPv6 from PaaS
+        "geo_bypass": True,
+        "http_headers": {
+            # "Real" browser-y headers quell some 403s
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.youtube.com/",
+        },
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "0"}
         ],
         "postprocessor_args": ["-ar", "22050", "-ac", "1"],
         "prefer_ffmpeg": True,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # First probe (no download) to enforce duration/livestream checks
+
+    # First probe WITHOUT download: reject long videos & lives early
+    probe_opts = dict(base_opts)
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         dur = int(info.get("duration") or 0)
         if info.get("is_live"):
             raise ValueError("Livestreams are not supported.")
         if dur and dur > config.MAX_YOUTUBE_DURATION_SEC:
             raise ValueError(f"Video too long: {dur}s exceeds limit of {config.MAX_YOUTUBE_DURATION_SEC}s")
-        # Download after passing checks
-        info = ydl.extract_info(url, download=True)
-        vid = info.get("id")
-        wav_path = os.path.join(tmp_dir, f"{vid}.wav")
-        if not os.path.exists(wav_path):
-            # Fallback if postprocessor did not emit wav
-            in_file = ydl.prepare_filename(info)
-            subprocess.run(["ffmpeg", "-y", "-i", in_file, "-ar", "22050", "-ac", "1", wav_path], check=True)
-        return wav_path, info
+
+    # Try a couple of player clients to avoid 403 from certain CDNs
+    clients = ["android", "web_safari"]
+    last_err = None
+    for client in clients:
+        try:
+            ydl_opts = dict(base_opts)
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                vid = info.get("id")
+                wav_path = os.path.join(tmp_dir, f"{vid}.wav")
+                if not os.path.exists(wav_path):
+                    in_file = ydl.prepare_filename(info)
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", in_file, "-ar", "22050", "-ac", "1", wav_path],
+                        check=True
+                    )
+                return wav_path, info
+        except Exception as e:
+            last_err = e
+            continue
+    # If all clients failed, raise the last error (will be surfaced as job failure)
+    raise last_err if last_err else RuntimeError("yt-dlp failed without error")
 
 def process_youtube_job(url: str) -> dict:
     tmp_dir = tempfile.mkdtemp(prefix="yt_")
@@ -570,7 +598,7 @@ async def transcribe_url(request: Request, payload: DirectURLJob):
 
 
 @app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
-@limiter.limit("60/minute", key_func=job_rate_key)
+@limiter.limit("120/minute", key_func=job_rate_key)
 async def job_status(request: Request, job_id: str):
     if not redis_conn:
         return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
@@ -583,7 +611,7 @@ async def job_status(request: Request, job_id: str):
 
 # Alias endpoint that returns the result directly when finished (common in UIs)
 @app.get("/jobs/{job_id}/result", summary="Get finished job result", tags=["Transcription"])
-@limiter.limit("60/minute", key_func=job_rate_key)
+@limiter.limit("120/minute", key_func=job_rate_key)
 async def job_result(request: Request, job_id: str):
     if not redis_conn:
         return JSONResponse(status_code=503, content={"job_id": job_id, "status": "unavailable", "finished": False, "result": None, "error": "Queue not available"})
