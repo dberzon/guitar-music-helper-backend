@@ -11,7 +11,7 @@ import platform
 import gc
 import re
 import shutil
-from typing import Dict, TypedDict, List, Optional, Union
+from typing import Dict, TypedDict, List, Optional, Union, Literal
 from pathlib import Path
 from contextlib import asynccontextmanager
 import hashlib
@@ -477,7 +477,7 @@ class YouTubeJob(BaseModel):
 # Request validation models
 # -------------------------------
 class TranscribeRequest(BaseModel):
-    kind: str = Field(..., pattern=r"^(file|url|youtube)$")
+    kind: Literal["file","url","youtube"]
     url: Optional[HttpUrl] = None
     youtube: Optional[str] = Field(None, max_length=255)
     immediate: Optional[bool] = False
