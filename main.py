@@ -6,6 +6,11 @@ import asyncio
 import logging
 import uuid
 import subprocess
+import sys
+import platform
+import gc
+import re
+import shutil
 from typing import Dict, TypedDict, List, Optional, Union
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -23,8 +28,6 @@ from redis import Redis, ConnectionPool
 from rq import Queue
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import yt_dlp
-import subprocess
-import re
 import uvicorn
 import aiofiles
 import requests
@@ -512,6 +515,23 @@ def _download_to_wav(tmp_dir: str, url: str) -> str:
     Stream-download the remote file with a size cap, then normalize to 22.05kHz mono WAV.
     Returns absolute path to the WAV file.
     """
+    # HEAD request to check content type and size before downloading
+    try:
+        head_resp = requests.head(url, timeout=10, allow_redirects=True)
+        head_resp.raise_for_status()
+        
+        # Check Content-Length if available
+        content_length = head_resp.headers.get("content-length")
+        if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"File too large: {content_length} bytes exceeds {MAX_DOWNLOAD_BYTES} byte limit")
+        
+        # Check Content-Type if available (allow common audio types)
+        content_type = head_resp.headers.get("content-type", "").lower()
+        if content_type and not any(ct in content_type for ct in ["audio/", "video/", "application/octet-stream"]):
+            logger.warning(f"Suspicious content type for URL {url}: {content_type}")
+    except Exception as e:
+        logger.warning(f"HEAD request failed for {url}: {e}, proceeding with download")
+    
     raw_path = os.path.join(tmp_dir, "in.bin")
     wav_path = os.path.join(tmp_dir, "in.wav")
 
@@ -692,21 +712,22 @@ def _check_youtube_dependencies() -> list[str]:
     return missing
 
 def _job_payload(job, include_result: bool = True) -> dict:
-    """Consistent JSON shape for job status/results."""
-    status = (
-        "finished" if job.is_finished else
-        "failed" if job.is_failed else
-        "started" if getattr(job, "is_started", False) else
-        "queued" if job.is_queued else
-        "deferred" if getattr(job, "is_deferred", False) else
-        "unknown"
-    )
+    """Consistent JSON shape for job status/results (rq-version-safe)."""
+    try:
+        status = job.get_status(refresh=False) or "unknown"
+    except Exception:
+        # Fallback for very old/new RQ versions
+        status = (
+            "finished" if getattr(job, "is_finished", False) else
+            "failed"   if getattr(job, "is_failed", False)   else
+            "unknown"
+        )
     return {
         "job_id": job.get_id(),
         "status": status,
-        "finished": job.is_finished,
-        "result": (job.result if (include_result and job.is_finished) else None),
-        "error": (str(job.exc_info) if job.is_failed else None),
+        "finished": status == "finished",
+        "result": (job.result if (include_result and status == "finished") else None),
+        "error": (str(job.exc_info) if status == "failed" else None),
     }
 
 # Initialize metrics collection
@@ -960,9 +981,10 @@ def liveness_probe():
 async def readiness_probe():
     checks = {
         "api": True,
-        "redis": await check_redis_connection(),
+        "redis": bool(redis_conn) and bool(job_queue),
         "disk_space": check_disk_space(),
-        "ffmpeg": check_ffmpeg(),
+        "ffmpeg": _which("ffmpeg") is not None,
+        "yt_dlp": _find_spec("yt_dlp") is not None,
     }
     return {"ready": all(checks.values()), "checks": checks}
 
@@ -1007,6 +1029,9 @@ async def detailed_health_check():
     return {"status": status, "checks": checks}
 
 # --- Audio Processing Helper Functions ---
+# Note: Heavy ML libraries (librosa, basic_pitch, numpy) are imported lazily
+# inside functions to reduce startup memory footprint and improve cold-start performance
+
 # capture helper (stdout) for lightweight probes like ffprobe - keep alongside _run
 def _capture(cmd: list[str], name: str, timeout: int = 30) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -1085,7 +1110,8 @@ def load_audio_file(file_path: str, max_duration: Optional[float] = None) -> tup
     """Load audio file with memory-efficient settings"""
     try:
         import librosa
-        audio, sr = librosa.load(file_path, sr=22050, mono=True, duration=max_duration)
+        # use the configured TARGET_SR for consistency across all ingest paths
+        audio, sr = librosa.load(file_path, sr=TARGET_SR, mono=True, duration=max_duration)
         duration = librosa.get_duration(y=audio, sr=sr)
         logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
         return audio, sr, duration
@@ -1112,7 +1138,7 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
     and labels crude maj/min triads. Merges consecutive duplicates.
     """
     try:
-        import numpy as np
+        import numpy as np  # Lazy import to reduce startup memory
     except Exception:
         return []
     if not events or duration <= 0:
@@ -1251,7 +1277,7 @@ async def test_minimal_processing(request: Request, file: UploadFile = Depends(v
             import gc
             gc.collect()  # Clean memory before loading
             
-            audio, sr = librosa.load(tmp_path, sr=22050, mono=True, duration=10.0)  # Limit to 10 seconds
+            audio, sr = librosa.load(tmp_path, sr=TARGET_SR, mono=True, duration=10.0)  # Limit to 10 seconds
             step_results["librosa_load"] = f"OK - {len(audio)} samples at {sr}Hz"
             
             # Clean up audio data immediately
@@ -1380,7 +1406,7 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
         estimated_memory_mb = (file_size_mb * 4) if file_size_mb is not None else 50
         
         # Allow overriding memory limit via env if you're on a paid plan
-        railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "500"))
+        railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "8192"))
         
         return {
             "success": True,
@@ -1446,7 +1472,8 @@ async def transcribe_audio(
             if not _is_audio_by_ffprobe(tmp_path):
                 raise HTTPException(status_code=415, detail="Uploaded file does not appear to be an audio file.")
             estimated_memory = file_size_mb * 4  # conservative
-            railway_memory_limit = 500
+            # read plan memory from env (e.g., 8192 on paid plan) for accurate gating
+            railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "8192"))
             if estimated_memory > railway_memory_limit * 0.8:
                 logger.warning(f"File {file.filename} ~{estimated_memory:.2f}MB est. memory (close to limit)")
             if not check_memory_availability(estimated_memory):
@@ -1465,20 +1492,31 @@ async def transcribe_audio(
                     metrics.record_processing_time(endpoint_name, 0.0)
                     return cached
 
-            # Run the blocking, CPU-intensive function in the thread pool with timeout
-            executor = request.app.state.executor
-            loop = asyncio.get_running_loop()
+            # Normalize/trim to analysis-ready WAV so ML gets consistent input (matches YT/URL paths)
+            norm_wav = await _prepare_audio(tmp_path)
             
-            # Add timeout to prevent Railway from timing out
             try:
-                processing_result_dict = await asyncio.wait_for(
-                    loop.run_in_executor(executor, process_audio_file_sync, tmp_path),
-                    timeout=config.PROCESSING_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
-                metrics.record_error(endpoint_name, "timeout")
-                raise ProcessingTimeoutError(f"Timed out after {config.PROCESSING_TIMEOUT}s")
+                # Run the blocking, CPU-intensive function in the thread pool with timeout
+                executor = request.app.state.executor
+                loop = asyncio.get_running_loop()
+                
+                # Add timeout to prevent Railway from timing out
+                try:
+                    processing_result_dict = await asyncio.wait_for(
+                        loop.run_in_executor(executor, process_audio_file_sync, norm_wav),
+                        timeout=config.PROCESSING_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
+                    metrics.record_error(endpoint_name, "timeout")
+                    raise ProcessingTimeoutError(f"Timed out after {config.PROCESSING_TIMEOUT}s")
+            finally:
+                # Clean up normalized WAV file
+                if norm_wav and os.path.exists(norm_wav):
+                    try:
+                        os.unlink(norm_wav)
+                    except Exception:
+                        pass
             
             processing_time = time.time() - start_time
             logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s. Final memory usage: {get_memory_usage():.1f}MB")
