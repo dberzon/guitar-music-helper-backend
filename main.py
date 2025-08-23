@@ -1,10 +1,12 @@
 import os
 import tempfile
+import base64
 import time
 import asyncio
 import logging
 import uuid
-from typing import Dict, TYPE_CHECKING, TypedDict, List, Optional, Union
+import subprocess
+from typing import Dict, TypedDict, List, Optional, Union
 from pathlib import Path
 from contextlib import asynccontextmanager
 import hashlib
@@ -17,9 +19,9 @@ import importlib.util as _importlib_util
 from shutil import which as _which
 
 # --- New: Background jobs + YouTube support ---
-from redis import Redis
+from redis import Redis, ConnectionPool
 from rq import Queue
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import yt_dlp
 import subprocess
 import re
@@ -27,7 +29,6 @@ import uvicorn
 import aiofiles
 import requests
 from pydantic_settings import BaseSettings
-from pydantic import Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
@@ -40,12 +41,6 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
     psutil = None
-
-# Type hints for static analysis even when imports fail
-if TYPE_CHECKING:
-    # Type-only imports for editors; not used at runtime
-    from models import TranscriptionResponse, TranscriptionResult, TranscriptionMetadata
-    from transcription_utils import process_basic_pitch_output
 
 # Runtime-safe import of the processing helper
 try:
@@ -71,6 +66,17 @@ ALLOWED_MIME_TYPES = {
     '.flac': ['audio/flac', 'audio/x-flac', 'application/octet-stream'],
     '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
 }
+
+# Audio preprocessing defaults (configurable via env)
+TARGET_SR = int(os.getenv("AUDIO_TARGET_SR", "22050"))  # set to 16000 to test lower SR
+# Keep a hard server-side cap; trim with ffmpeg to avoid huge arrays in Python
+MAX_AUDIO_DURATION_S = int(os.getenv("MAX_AUDIO_SECONDS", "900"))  # 15 minutes
+
+# Validate/sanitize caps
+if MAX_AUDIO_DURATION_S <= 0:
+    MAX_AUDIO_DURATION_S = 900
+if TARGET_SR not in (16000, 22050, 24000, 32000, 44100):
+    TARGET_SR = 22050
 
 # --- Memory Management Utilities ---
 def get_memory_usage() -> float:
@@ -305,16 +311,10 @@ class ProcessingTimeoutError(AudioProcessingError):
 DEPENDENCIES_LOADED = False
 MODELS_LOADED = False
 
-# Attempt to import optional ML dependencies to set runtime flags
-try:
-    import librosa  # type: ignore
-    import numpy as np  # type: ignore
-    from basic_pitch.inference import predict  # type: ignore
-    DEPENDENCIES_LOADED = True
-    MODELS_LOADED = True
-except Exception:
-    DEPENDENCIES_LOADED = False
-    MODELS_LOADED = False
+# Attempt to detect optional ML dependencies without importing heavy modules
+from importlib.util import find_spec as _find_spec
+DEPENDENCIES_LOADED = all(_find_spec(n) is not None for n in ("librosa", "numpy", "basic_pitch"))
+MODELS_LOADED = DEPENDENCIES_LOADED
 
 
 def require_debug_enabled():
@@ -354,8 +354,20 @@ def is_youtube_url(u: str) -> bool:
     return re.match(YOUTUBE_REGEX, u or "", flags=re.IGNORECASE) is not None
 
 def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
-    """Download YT audio with yt-dlp → mono 22.05kHz WAV (ffmpeg). Hardened for cloud IPs."""
+    """Download YT audio with yt-dlp → mono 22.05 kHz WAV. Hardened for cloud IPs."""
     out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+    # Optional cookie support (exported from your browser, base64 in env)
+    cookiefile_path = None
+    b64 = os.getenv("YTDLP_COOKIES_B64")
+    if b64:
+        try:
+            cookiefile_path = os.path.join(tmp_dir, "cookies.txt")
+            with open(cookiefile_path, "wb") as f:
+                f.write(base64.b64decode(b64))
+        except Exception:
+            cookiefile_path = None  # fall back without cookies
+    proxy = os.getenv("YTDLP_PROXY")  # e.g. http://user:pass@host:port  (optional)
+
     base_opts = {
         "format": "bestaudio/best",
         "outtmpl": out_tmpl,
@@ -365,10 +377,9 @@ def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
         "fragment_retries": 3,
         "concurrent_fragment_downloads": 1,
         "socket_timeout": 30,
-        "forceipv4": True,               # some CDNs reject IPv6 from PaaS
+        "forceipv4": True,            # IPv6 sometimes blocked on PaaS
         "geo_bypass": True,
         "http_headers": {
-            # "Real" browser-y headers quell some 403s
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.youtube.com/",
@@ -376,13 +387,16 @@ def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "0"}
         ],
-        "postprocessor_args": ["-ar", "22050", "-ac", "1"],
+        "postprocessor_args": ["-ar", str(TARGET_SR), "-ac", "1"],
         "prefer_ffmpeg": True,
     }
+    if proxy:
+        base_opts["proxy"] = proxy
+    if cookiefile_path:
+        base_opts["cookiefile"] = cookiefile_path
 
-    # First probe WITHOUT download: reject long videos & lives early
-    probe_opts = dict(base_opts)
-    with yt_dlp.YoutubeDL(probe_opts) as ydl:
+    # Probe WITHOUT download to enforce your guards
+    with yt_dlp.YoutubeDL(dict(base_opts)) as ydl:
         info = ydl.extract_info(url, download=False)
         dur = int(info.get("duration") or 0)
         if info.get("is_live"):
@@ -390,10 +404,10 @@ def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
         if dur and dur > config.MAX_YOUTUBE_DURATION_SEC:
             raise ValueError(f"Video too long: {dur}s exceeds limit of {config.MAX_YOUTUBE_DURATION_SEC}s")
 
-    # Try a couple of player clients to avoid 403 from certain CDNs
-    clients = ["android", "web_safari"]
+    # Try a couple of player clients to dodge some bot checks
+    clients = os.getenv("YTDLP_PLAYER_CLIENTS", "android,web_safari").split(",")
     last_err = None
-    for client in clients:
+    for client in [c.strip() for c in clients if c.strip()]:
         try:
             ydl_opts = dict(base_opts)
             ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
@@ -403,15 +417,15 @@ def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
                 wav_path = os.path.join(tmp_dir, f"{vid}.wav")
                 if not os.path.exists(wav_path):
                     in_file = ydl.prepare_filename(info)
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", in_file, "-ar", "22050", "-ac", "1", wav_path],
-                        check=True
-                    )
+                    subprocess.run(["ffmpeg", "-y", "-i", in_file, "-ar", str(TARGET_SR), "-ac", "1", wav_path], check=True)
                 return wav_path, info
         except Exception as e:
             last_err = e
+            # If bot/CAPTCHA message seen and we had no cookies, hint that cookies are required
+            err_str = str(e)
+            if ("not a bot" in err_str.lower() or "confirm you're not a bot" in err_str.lower()) and not cookiefile_path:
+                raise RuntimeError("YouTube challenged this IP. Add cookies via YTDLP_COOKIES_B64.") from e
             continue
-    # If all clients failed, raise the last error (will be surfaced as job failure)
     raise last_err if last_err else RuntimeError("yt-dlp failed without error")
 
 def process_youtube_job(url: str) -> dict:
@@ -435,6 +449,16 @@ def process_youtube_job(url: str) -> dict:
             "melody": result.get("melody", []),
             "tempo": tempo if isinstance(tempo, dict) else ({"bpm": tempo} if tempo else None),
         }
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"yt-dlp download error for URL={url}: {e}", exc_info=True)
+        # Surface a meaningful, stable message to the UI
+        raise AudioProcessingError(f"YouTube download failed: {e}") from e
+    except subprocess.CalledProcessError as e:
+        logger.error(f"ffmpeg conversion failed for URL={url}: {e}", exc_info=True)
+        raise AudioProcessingError("ffmpeg failed while converting audio to WAV") from e
+    except Exception as e:
+        logger.error(f"Unexpected error in process_youtube_job for URL={url}: {e}", exc_info=True)
+        raise AudioProcessingError(f"process_youtube_job failed: {e}") from e
     finally:
         try:
             import shutil
@@ -445,6 +469,26 @@ def process_youtube_job(url: str) -> dict:
 
 class YouTubeJob(BaseModel):
     url: str
+
+# -------------------------------
+# Request validation models
+# -------------------------------
+class TranscribeRequest(BaseModel):
+    kind: str = Field(..., regex=r"^(file|url|youtube)$")
+    url: Optional[HttpUrl] = None
+    youtube: Optional[str] = Field(None, max_length=255)
+    immediate: Optional[bool] = False
+
+    class Config:
+        max_anystr_length = 255
+
+    @model_validator(mode="after")
+    def _validate_one_of(self):
+        if self.kind == "url" and not self.url:
+            raise ValueError("url is required when kind=url")
+        if self.kind == "youtube" and not self.youtube:
+            raise ValueError("youtube id/url is required when kind=youtube")
+        return self
 
 # -------------------------------
 # Direct URL transcription (BG job)
@@ -486,7 +530,7 @@ def _download_to_wav(tmp_dir: str, url: str) -> str:
     # Normalize via ffmpeg → 22.05kHz mono WAV
     # You can tweak the sample rate/channels to match your pipeline defaults.
     subprocess.run(
-        ["ffmpeg", "-y", "-i", raw_path, "-ar", "22050", "-ac", "1", wav_path],
+        ["ffmpeg", "-y", "-i", raw_path, "-ar", str(TARGET_SR), "-ac", "1", wav_path],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -536,6 +580,8 @@ async def lifespan(app: FastAPI):
         pass
 
 
+APP_ENV = os.getenv("APP_ENV", "production").lower()
+IS_DEV = APP_ENV in ("dev", "development", "local")
 app = FastAPI(
     title="Guitar Music Helper Backend",
     description="Audio transcription API for guitar music helper",
@@ -548,7 +594,8 @@ app = FastAPI(
 # Initialize Redis/RQ queue for background audio jobs (optional)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 try:
-    redis_conn = Redis.from_url(REDIS_URL)
+    redis_pool = ConnectionPool.from_url(REDIS_URL, max_connections=10)
+    redis_conn = Redis(connection_pool=redis_pool)
     job_queue = Queue("gmh-audio", connection=redis_conn)
     logger.info("RQ connected and queue ready.")
 except Exception as _e:
@@ -868,6 +915,28 @@ async def environment_info():
         "debug_endpoints_enabled": config.ENABLE_DEBUG_ENDPOINTS,
     }
 
+# --- Health check helper functions ---
+async def check_redis_connection() -> bool:
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, redis_conn.ping)
+        return True
+    except Exception as e:
+        logger.warning("Redis ping failed: %s", e)
+        return False
+
+def check_disk_space(min_free_bytes: int = 300 * 1024 * 1024) -> bool:
+    import shutil
+    total, used, free = shutil.disk_usage("/tmp")
+    return free >= min_free_bytes
+
+def check_ffmpeg() -> bool:
+    try:
+        _run(["ffmpeg", "-version"], "ffmpeg")
+        _run(["ffprobe", "-version"], "ffprobe")
+        return True
+    except Exception:
+        return False
+
 @app.get("/health", summary="Health Check", tags=["Status"])
 async def health_check():
     """Performs a detailed health check of the service and its dependencies."""
@@ -884,12 +953,18 @@ async def health_check():
         return {"status": "error", "message": str(e)}
 
 @app.get("/health/live", summary="Liveness Probe", tags=["Status"])
-async def liveness_probe():
-    return {"status": "alive"}
+def liveness_probe():
+    return {"alive": True}
 
 @app.get("/health/ready", summary="Readiness Probe", tags=["Status"])
 async def readiness_probe():
-    return {"status": "ready" if DEPENDENCIES_LOADED else "not ready"}
+    checks = {
+        "api": True,
+        "redis": await check_redis_connection(),
+        "disk_space": check_disk_space(),
+        "ffmpeg": check_ffmpeg(),
+    }
+    return {"ready": all(checks.values()), "checks": checks}
 
 @app.get("/health/detailed", summary="Detailed Health Check", tags=["Status"])
 async def detailed_health_check():
@@ -932,9 +1007,84 @@ async def detailed_health_check():
     return {"status": status, "checks": checks}
 
 # --- Audio Processing Helper Functions ---
+# capture helper (stdout) for lightweight probes like ffprobe - keep alongside _run
+def _capture(cmd: list[str], name: str, timeout: int = 30) -> str:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{name} failed ({proc.returncode}): {proc.stderr.strip()}")
+    return (proc.stdout or "").strip()
+
+def _run(cmd, step_name):
+    """Run subprocess command with error handling"""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        # e.stderr may be bytes or None; guard decode safely
+        err = (e.stderr.decode("utf-8", "ignore") if isinstance(e.stderr, (bytes, bytearray)) else str(e.stderr))
+        raise RuntimeError(f"{step_name} failed: {err}")
+
+def _ffmpeg_basic_wav(input_path: str, output_path: str, sr: int = TARGET_SR, max_sec: int = MAX_AUDIO_DURATION_S) -> None:
+    """
+    Downmix to mono, resample, **trim to max_sec** at the demuxer, and write wav.
+    Trimming here prevents Python from loading huge arrays into memory.
+    """
+    # -t applies an output duration limit; keep it early in the chain.
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-t", str(max_sec),
+        "-ac", "1",              # mono
+        "-ar", str(sr),          # sample rate
+        "-vn", "-sn", "-dn",     # no video/subs/data
+        output_path,
+    ]
+    _run(cmd, "ffmpeg")
+
+def _is_audio_by_ffprobe(path: str) -> bool:
+    """
+    Validate that the file has at least one audio stream before loading into Python.
+    Avoids non-audio uploads causing decoder churn.
+    """
+    try:
+        out = _capture(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            "ffprobe"
+        )
+        return "audio" in out.lower()
+    except Exception as e:
+        logger.warning("ffprobe validation failed: %s", e)
+        return False
+
+async def _prepare_audio(input_path: str) -> str:
+    """
+    Convert arbitrary media to analysis-ready wav (mono, resampled).
+    Returns a path to a temp wav file.
+    """
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    _ffmpeg_basic_wav(input_path, wav_path, sr=TARGET_SR, max_sec=MAX_AUDIO_DURATION_S)
+    return wav_path
+
+def _load_audio_array(wav_path: str):
+    """
+    Load into memory for model. Keep dtype small to reduce RAM.
+    Assumes wav_path already trimmed to MAX_AUDIO_DURATION_S.
+    """
+    import soundfile as sf
+    audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+    # Safety: if something upstream failed to trim, enforce here too
+    # (fast slice; avoids unexpected spikes).
+    import math
+    max_samples = int(MAX_AUDIO_DURATION_S * sr)
+    if audio.shape[0] > max_samples:
+        audio = audio[:max_samples]
+    return audio, sr
+
 def load_audio_file(file_path: str, max_duration: Optional[float] = None) -> tuple:
     """Load audio file with memory-efficient settings"""
     try:
+        import librosa
         audio, sr = librosa.load(file_path, sr=22050, mono=True, duration=max_duration)
         duration = librosa.get_duration(y=audio, sr=sr)
         logger.info(f"Audio loaded: duration={duration:.2f}s, sample_rate={sr}Hz, audio_shape={audio.shape}")
@@ -946,12 +1096,63 @@ def load_audio_file(file_path: str, max_duration: Optional[float] = None) -> tup
 def run_basic_pitch_prediction(file_path: str) -> tuple:
     """Run basic-pitch prediction on audio file"""
     try:
+        from basic_pitch.inference import predict
         model_output, midi_data, note_events = predict(file_path)
         logger.info(f"Basic-pitch prediction complete. Found {len(note_events)} note events.")
         return model_output, midi_data, note_events
     except Exception as e:
         logger.error(f"Basic-pitch prediction failed for {file_path}: {e}")
         raise
+
+# --- Naive chord fallback (Basic-Pitch‑friendly) -----------------------------
+def get_naive_chords_from_notes(events: List[dict], duration: float, window: float = 1.0) -> List[Dict]:
+    """
+    Fallback chord detection tuned to Basic-Pitch note events.
+    Looks at active notes in fixed windows, selects a root by mode,
+    and labels crude maj/min triads. Merges consecutive duplicates.
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return []
+    if not events or duration <= 0:
+        return []
+    pc_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    def _note_range(ev):
+        st = ev.get("start_time") or ev.get("onset_time") or 0.0
+        en = ev.get("end_time") or ev.get("offset_time") or 0.0
+        return float(st), float(en)
+    def _midi_pc(ev):
+        midi = ev.get("midi_note") or ev.get("pitch") or 60
+        return int(midi) % 12
+    chords_out: List[Dict] = []
+    t = 0.0
+    while t < max(duration, 1e-3):
+        t_end = min(t + window, duration)
+        pcs: List[int] = []
+        mid = (t + t_end) * 0.5
+        for ev in events:
+            st, en = _note_range(ev)
+            if st <= mid <= en:
+                pcs.append(_midi_pc(ev))
+        if pcs:
+            hist = np.bincount(pcs, minlength=12)
+            root = int(hist.argmax())
+            has_m3 = hist[(root + 3) % 12]
+            has_M3 = hist[(root + 4) % 12]
+            has_P5 = hist[(root + 7) % 12]
+            qual = "" if (has_M3 >= has_m3 and has_P5) else "m"
+            name = pc_names[root] + qual
+            chords_out.append({"time": float(t), "duration": float(t_end - t), "chord": name})
+        t = t_end
+    # merge consecutive duplicates
+    merged: List[Dict] = []
+    for c in chords_out:
+        if merged and merged[-1]["chord"] == c["chord"]:
+            merged[-1]["duration"] += c["duration"]
+        else:
+            merged.append(c)
+    return merged
 
 # --- Synchronous Processing Function ---
 
@@ -960,6 +1161,7 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
     Orchestrator function that coordinates audio processing steps.
     Broken down into smaller, testable functions for better maintainability.
     """
+    # heavy-lift transcription and harmony
     import gc  # Import garbage collector for memory management
     
     try:
@@ -989,67 +1191,10 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
         )
         logger.info("Processing complete, returning results...")
         
-        # If helper returned no chords, apply a naive, safe fallback from note events
-        def _naive_chords_from_notes(events, total_dur, window=1.0):
-            try:
-                if not events:
-                    return []
-                # bucket by 1s windows, tally pitch classes
-                pc_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-                chords_out = []
-                t = 0.0
-                while t < max(total_dur, 0.001):
-                    t_end = min(t + window, total_dur)
-                    pcs = {}
-                    for ev in events:
-                        # accept multiple shapes (basic-pitch uses onset_time/offset_time)
-                        st = (
-                            getattr(ev, "start_time", None)
-                            or getattr(ev, "onset_time", None)
-                            or (ev.get("start_time") if isinstance(ev, dict) else None)
-                            or (ev.get("onset_time") if isinstance(ev, dict) else None)
-                            or 0.0
-                        )
-                        en = (
-                            getattr(ev, "end_time", None)
-                            or getattr(ev, "offset_time", None)
-                            or (ev.get("end_time") if isinstance(ev, dict) else None)
-                            or (ev.get("offset_time") if isinstance(ev, dict) else None)
-                            or 0.0
-                        )
-                        if st <= (t + t_end) / 2 <= en:
-                            midi = int(
-                                getattr(ev, "midi_note", None)
-                                or getattr(ev, "pitch", None)
-                                or (ev.get("midi_note") if isinstance(ev, dict) else None)
-                                or (ev.get("pitch") if isinstance(ev, dict) else 60)
-                            )
-                            pc = midi % 12
-                            pcs[pc] = pcs.get(pc, 0) + 1
-                    if pcs:
-                        root_pc = max(pcs.items(), key=lambda x: x[1])[0]
-                        # crude maj/min decision
-                        has_m3 = pcs.get((root_pc + 3) % 12, 0)
-                        has_M3 = pcs.get((root_pc + 4) % 12, 0)
-                        has_P5 = pcs.get((root_pc + 7) % 12, 0)
-                        qual = "" if (has_M3 >= has_m3 and has_P5) else "m"
-                        name = pc_names[root_pc] + qual
-                        chords_out.append({"time": float(t), "duration": float(t_end - t), "chord": name})
-                    t = t_end
-                # merge consecutive duplicates
-                merged = []
-                for c in chords_out:
-                    if merged and merged[-1]["chord"] == c["chord"]:
-                        merged[-1]["duration"] += c["duration"]
-                    else:
-                        merged.append(c)
-                return merged
-            except Exception:
-                return []
-
+        # If helper returned no chords, apply a naïve, safe fallback from note events
         chords_list = transcription_data.get("chords", [])
         if not chords_list:
-            chords_list = _naive_chords_from_notes(note_events, duration)
+            chords_list = get_naive_chords_from_notes(note_events, duration, window=1.0)
 
         # Clean up intermediate data after potential fallback
         del model_output, midi_data, note_events
@@ -1234,8 +1379,8 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
         # Basic-pitch typically needs 3–5× the audio size; use 4× as a conservative middle
         estimated_memory_mb = (file_size_mb * 4) if file_size_mb is not None else 50
         
-        # Railway Hobby plan has ~512MB available memory
-        railway_memory_limit = 500  # Conservative estimate
+        # Allow overriding memory limit via env if you're on a paid plan
+        railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "500"))
         
         return {
             "success": True,
@@ -1298,7 +1443,7 @@ async def transcribe_audio(
                     detail=f"File is too large ({file_size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
                 )
             # Optional content sniff (best effort)
-            if not validate_audio_content(tmp_path):
+            if not _is_audio_by_ffprobe(tmp_path):
                 raise HTTPException(status_code=415, detail="Uploaded file does not appear to be an audio file.")
             estimated_memory = file_size_mb * 4  # conservative
             railway_memory_limit = 500
@@ -1509,6 +1654,13 @@ async def get_rate_limits():
         "note": "Rate limits are per IP address"
     }
 
+# --- Debug Router Inclusion ---
+if IS_DEV:
+    try:
+        from debug_routes import router as debug_router  # optional module
+        app.include_router(debug_router, prefix="/_debug")
+    except Exception:
+        pass
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
