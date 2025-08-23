@@ -477,7 +477,7 @@ class YouTubeJob(BaseModel):
 # Request validation models
 # -------------------------------
 class TranscribeRequest(BaseModel):
-    kind: str = Field(..., regex=r"^(file|url|youtube)$")
+    kind: str = Field(..., pattern=r"^(file|url|youtube)$")
     url: Optional[HttpUrl] = None
     youtube: Optional[str] = Field(None, max_length=255)
     immediate: Optional[bool] = False
