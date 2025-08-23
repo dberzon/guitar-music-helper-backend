@@ -28,6 +28,7 @@ from redis import Redis, ConnectionPool
 from rq import Queue
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import yt_dlp
+from base64 import b64decode
 import uvicorn
 import aiofiles
 import requests
@@ -356,19 +357,32 @@ YOUTUBE_REGEX = r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/'
 def is_youtube_url(u: str) -> bool:
     return re.match(YOUTUBE_REGEX, u or "", flags=re.IGNORECASE) is not None
 
+def _prepare_cookiefile_from_env(tmp_dir: str) -> Optional[str]:
+    """
+    Optionally prepare a cookies.txt file from env vars:
+      - YT_COOKIES: raw Netscape-format cookies.txt text
+      - YT_COOKIES_B64: base64-encoded cookies.txt
+    Returns path or None.
+    """
+    raw = os.getenv("YT_COOKIES")
+    b64 = os.getenv("YT_COOKIES_B64")
+    if not raw and not b64:
+        return None
+    path = os.path.join(tmp_dir, "cookies.txt")
+    try:
+        data = raw if raw else b64decode(b64).decode("utf-8", errors="ignore")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+        return path
+    except Exception as e:
+        logging.warning("Failed to load cookies from env: %s", e)
+        return None
+
 def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
     """Download YT audio with yt-dlp → mono 22.05 kHz WAV. Hardened for cloud IPs."""
     out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
     # Optional cookie support (exported from your browser, base64 in env)
-    cookiefile_path = None
-    b64 = os.getenv("YTDLP_COOKIES_B64")
-    if b64:
-        try:
-            cookiefile_path = os.path.join(tmp_dir, "cookies.txt")
-            with open(cookiefile_path, "wb") as f:
-                f.write(base64.b64decode(b64))
-        except Exception:
-            cookiefile_path = None  # fall back without cookies
+    cookiefile_path = _prepare_cookiefile_from_env(tmp_dir)
     proxy = os.getenv("YTDLP_PROXY")  # e.g. http://user:pass@host:port  (optional)
 
     base_opts = {
@@ -461,7 +475,15 @@ def process_youtube_job(url: str) -> dict:
         raise AudioProcessingError("ffmpeg failed while converting audio to WAV") from e
     except Exception as e:
         logger.error(f"Unexpected error in process_youtube_job for URL={url}: {e}", exc_info=True)
-        raise AudioProcessingError(f"process_youtube_job failed: {e}") from e
+        msg = str(e)
+        # Give the frontend a friendly, actionable error
+        if "Sign in to confirm you're not a bot" in msg or "confirm you're not a bot" in msg:
+            raise AudioProcessingError(
+                "YouTube blocked the request (bot/age verification). "
+                "Try another URL, or add cookies: set env YT_COOKIES (raw Netscape cookies.txt) "
+                "or YT_COOKIES_B64 (base64 of cookies.txt) in Railway, then redeploy."
+            ) from e
+        raise AudioProcessingError(f"YouTube download failed: {msg}") from e
     finally:
         try:
             import shutil
