@@ -6,7 +6,6 @@ basic-pitch==0.2.5
 librosa==0.10.1
 soundfile==0.12.1  # libsndfile-backed I/O for librosa; avoids audioread edge cases
 numpy==1.23.5
-scipy==1.11.4
 pydantic==2.5.0
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
@@ -18,3 +17,13 @@ rq==1.16.2
 redis==5.0.7
 ffmpeg-python==0.2.0
 supabase==2.6.0
+
+# --- Madmom and build-time requirements (pinned to avoid ABI/API breakages) ---
+madmom==0.16.1
+scipy==1.10.1
+Cython==0.29.36      # cython < 3 prevents build issues
+mido==1.3.0
+
+# Optional (only if you need these features)
+# pyaudio==0.2.13    # live/streaming audio input
+# pyfftw==0.13.1     # faster FFTs (add if you agree)

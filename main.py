@@ -1,3 +1,9 @@
+import logging
+
+# Module-level logger for consistent logging across the module
+logger = logging.getLogger(__name__)
+
+
 def _normalize_madmom_label(label: str) -> Optional[str]:
     lbl = str(label)
     if lbl in ("N", "X", "no_chord"):
@@ -28,10 +34,26 @@ def _normalize_madmom_label(label: str) -> Optional[str]:
 # --- Madmom Chord Recognition Integration ---
 def detect_chords_madmom(audio_path: str):
     """Use Madmom's state-of-the-art chord detection with label normalization."""
+    # Prefer pre-instantiated processors when available for performance.
+    global MADMOM_CNN_PROCESSOR, MADMOM_CRF_PROCESSOR
+    if MADMOM_CNN_PROCESSOR is not None and MADMOM_CRF_PROCESSOR is not None:
+        cnn_proc = MADMOM_CNN_PROCESSOR
+        crf_proc = MADMOM_CRF_PROCESSOR
+    else:
+        # Try a lazy import + instantiation for environments where module-level
+        # pre-instantiation wasn't possible (e.g., missing weights or transient
+        # environment issues).
+        try:
+            from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognitionProcessor
+            cnn_proc = CNNChordFeatureProcessor()
+            crf_proc = CRFChordRecognitionProcessor()
+        except (ImportError, ModuleNotFoundError) as e:
+            logger.debug(f"Madmom not available: {e}")
+            return []
+
     try:
-        from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognitionProcessor
-        feats = CNNChordFeatureProcessor()(audio_path)
-        segs = CRFChordRecognitionProcessor()(feats)
+        feats = cnn_proc(audio_path)
+        segs = crf_proc(feats)
         out = []
         for start, end, label in segs:
             name = _normalize_madmom_label(label)
@@ -39,21 +61,19 @@ def detect_chords_madmom(audio_path: str):
                 continue
             out.append({"time": float(start), "duration": float(end - start), "chord": name})
         return out
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Madmom chord detection failed: {e}")
+    except (RuntimeError, ValueError, OSError) as e:
+        logger.warning(f"Madmom chord detection failed during processing: {e}")
         return []
 
 import os
 import tempfile
 import base64
+import binascii
 import time
 import asyncio
-import logging
 import uuid
 import subprocess
-import sys
-import platform
-import gc
+# sys, platform, and gc are imported locally where needed to avoid global overhead
 import re
 import shutil
 from typing import Dict, TypedDict, List, Optional, Union, Literal
@@ -68,8 +88,6 @@ try:
 except ImportError:
     # fallback for monolithic file or if not present
     import aiofiles
-from contextlib import asynccontextmanager
-import aiofiles
 @asynccontextmanager
 async def temporary_audio_file(file):
     suffix = Path(file.filename).suffix
@@ -84,21 +102,40 @@ async def temporary_audio_file(file):
     finally:
         try:
             os.unlink(tmp_path)
-        except Exception:
+        except OSError:
             pass
-    def get_file_hash(path):
-        """Return SHA256 hash of a file."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
-                h.update(chunk)
-        return h.hexdigest()
+
+# Utility: file hashing available at module scope
+def get_file_hash(path):
+    """Return SHA256 hash of a file."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 # --- Handle optional madmom import gracefully ---
 try:
     import madmom
 except ImportError:
     madmom = None
+
+# Module-level Madmom processors (singletons) - try to instantiate once for throughput.
+MADMOM_CNN_PROCESSOR = None
+MADMOM_CRF_PROCESSOR = None
+try:
+    if madmom is not None:
+        from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognitionProcessor
+        try:
+            MADMOM_CNN_PROCESSOR = CNNChordFeatureProcessor()
+            MADMOM_CRF_PROCESSOR = CRFChordRecognitionProcessor()
+            logger.info("Madmom processors instantiated at module import")
+        except Exception:
+            MADMOM_CNN_PROCESSOR = None
+            MADMOM_CRF_PROCESSOR = None
+except Exception:
+    MADMOM_CNN_PROCESSOR = None
+    MADMOM_CRF_PROCESSOR = None
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,12 +145,11 @@ from shutil import which as _which
 
 # --- New: Background jobs + YouTube support ---
 from redis import Redis, ConnectionPool
-from rq import Queue
+from rq import Queue, Retry
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import yt_dlp
 from base64 import b64decode
 import uvicorn
-import aiofiles
 import requests
 from pydantic_settings import BaseSettings
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -132,9 +168,9 @@ except ImportError:
 # Runtime-safe import of the processing helper, with explicit logging
 try:
     from transcription_utils import process_basic_pitch_output  # real implementation
-    logging.getLogger(__name__).info("Using real process_basic_pitch_output from transcription_utils.")
-except Exception as e:
-    logging.getLogger(__name__).warning(f"Using fallback process_basic_pitch_output (no-op) — accuracy will be poor. Import error: {e}")
+    logger.info("Using real process_basic_pitch_output from transcription_utils.")
+except (ImportError, ModuleNotFoundError) as e:
+    logger.warning(f"Using fallback process_basic_pitch_output (no-op) — accuracy will be poor. Import error: {e}")
     def process_basic_pitch_output(model_output, midi_data, note_events, sr, duration):
         return {"chords": [], "melody": [], "tempo": None}
 
@@ -145,6 +181,33 @@ class ProcessingResult(TypedDict):
     chords: List[Dict[str, Union[str, float]]]
     melody: List[Dict[str, Union[str, float]]]
     tempo: Optional[float]  # Tempo is typically a single float (BPM)
+
+
+# --- Pydantic response models (used by FastAPI to document responses) ---
+class ChordSegment(BaseModel):
+    time: float
+    duration: float
+    chord: str
+
+
+class MetadataModel(BaseModel):
+    filename: Optional[str] = None
+    processingTime: Optional[float] = None
+    duration: Optional[float] = None
+    sampleRate: Optional[int] = None
+    source: Optional[str] = None
+    videoId: Optional[str] = None
+    title: Optional[str] = None
+    uploader: Optional[str] = None
+    webpage_url: Optional[str] = None
+
+
+class TranscribeResponse(BaseModel):
+    metadata: MetadataModel
+    chords: List[ChordSegment]
+    melody: List[dict]
+    tempo: Optional[dict] = None
+    debug: Optional[dict] = None
 
 # --- Constants ---
 ALLOWED_MIME_TYPES = {
@@ -259,7 +322,9 @@ class Config(BaseSettings):
             # Vercel stable production domain
             "https://guitar-music-helper.vercel.app",
             # Example preview domain (keep yours if you use it)
-            "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app"
+            "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app",
+            # Your deployed Vercel domain
+            "https://guitar-music-helper-h9i35sgkq-dberzons-projects.vercel.app"
         ],
         description="List of allowed CORS origins"
     )
@@ -392,7 +457,7 @@ def _prepare_cookiefile_from_env(tmp_dir: str) -> Optional[str]:
         with open(path, "w", encoding="utf-8") as f:
             f.write(data)
         return path
-    except Exception as e:
+    except (binascii.Error, ValueError, UnicodeDecodeError, OSError) as e:
         logging.warning("Failed to load cookies from env: %s", e)
         return None
 
@@ -454,7 +519,7 @@ def yt_download_to_wav(tmp_dir: str, url: str) -> tuple[str, dict]:
                     in_file = ydl.prepare_filename(info)
                     subprocess.run(["ffmpeg", "-y", "-i", in_file, "-ar", str(TARGET_SR), "-ac", "1", wav_path], check=True)
                 return wav_path, info
-        except Exception as e:
+        except (yt_dlp.utils.DownloadError, subprocess.CalledProcessError, RuntimeError) as e:
             last_err = e
             # If bot/CAPTCHA message seen and we had no cookies, hint that cookies are required
             err_str = str(e)
@@ -506,7 +571,7 @@ def process_youtube_job(url: str) -> dict:
         try:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
+        except OSError:
             pass
 
 
@@ -559,17 +624,17 @@ def _download_to_wav(tmp_dir: str, url: str) -> str:
     try:
         head_resp = requests.head(url, timeout=10, allow_redirects=True)
         head_resp.raise_for_status()
-        
+
         # Check Content-Length if available
         content_length = head_resp.headers.get("content-length")
         if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
             raise ValueError(f"File too large: {content_length} bytes exceeds {MAX_DOWNLOAD_BYTES} byte limit")
-        
+
         # Check Content-Type if available (allow common audio types)
         content_type = head_resp.headers.get("content-type", "").lower()
         if content_type and not any(ct in content_type for ct in ["audio/", "video/", "application/octet-stream"]):
             logger.warning(f"Suspicious content type for URL {url}: {content_type}")
-    except Exception as e:
+    except requests.RequestException as e:
         logger.warning(f"HEAD request failed for {url}: {e}, proceeding with download")
     
     raw_path = os.path.join(tmp_dir, "in.bin")
@@ -621,7 +686,7 @@ def _process_direct_url_job(url: str) -> dict:
         try:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
+        except OSError:
             pass
 
 # --- FastAPI app and lifespan ---
@@ -669,18 +734,20 @@ except Exception as _e:
 @limiter.limit("3/minute")
 async def transcribe_youtube(request: Request, payload: YouTubeJob):
     if not job_queue:
-        return JSONResponse(status_code=503, content={"ok": False, "error": "Background queue not available"})
+        return JSONResponse(status_code=503, content={"success": False, "error": "Background queue not available"})
     # Ensure URL sanity
     if not is_youtube_url(payload.url):
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid YouTube URL"})
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid YouTube URL"})
 
     # Dependencies check
     missing = _check_youtube_dependencies()
     if missing:
-        return JSONResponse(status_code=503, content={"ok": False, "error": "Missing system dependencies", "details": missing})
+        return JSONResponse(status_code=503, content={"success": False, "error": "Missing system dependencies", "details": missing})
 
-    job = job_queue.enqueue(process_youtube_job, payload.url)
-    return JSONResponse(status_code=202, content={"ok": True, "job_id": job.get_id()})
+    # Retry transient failures up to 3 times with increasing intervals
+    retry_policy = Retry(max=3, interval=[10, 30, 60])
+    job = job_queue.enqueue(process_youtube_job, payload.url, retry=retry_policy)
+    return JSONResponse(status_code=202, content={"success": True, "job_id": job.get_id()})
 
 # Alias to support existing frontend integrations: /transcribe/youtube
 @app.post("/transcribe/youtube", summary="(alias) Submit a YouTube URL", tags=["Transcription"])
@@ -693,15 +760,16 @@ async def transcribe_youtube_alias(request: Request, payload: YouTubeJob):
 @limiter.limit("3/minute")
 async def transcribe_url(request: Request, payload: DirectURLJob):
     if not job_queue:
-        return JSONResponse(status_code=503, content={"ok": False, "error": "Background queue not available"})
+        return JSONResponse(status_code=503, content={"success": False, "error": "Background queue not available"})
     if not _is_http_url(payload.url):
-        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid or non-HTTP URL"})
+        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid or non-HTTP URL"})
     try:
         # Enqueue a background job; worker must be running: rq worker -u "$REDIS_URL" gmh-audio
-        job = job_queue.enqueue(_process_direct_url_job, payload.url)
-        return JSONResponse(status_code=202, content={"ok": True, "job_id": job.get_id()})
+        retry_policy = Retry(max=3, interval=[10, 30, 60])
+        job = job_queue.enqueue(_process_direct_url_job, payload.url, retry=retry_policy)
+        return JSONResponse(status_code=202, content={"success": True, "job_id": job.get_id()})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 
 @app.get("/jobs/{job_id}", summary="Check background transcription job status", tags=["Transcription"])
@@ -978,8 +1046,11 @@ def validate_audio_content(tmp_path: str) -> bool:
         import magic  # python-magic; optional, will skip if missing
         mime = magic.from_file(tmp_path, mime=True)
         return bool(mime and mime.startswith("audio/"))
+    except (ImportError, ModuleNotFoundError):
+        # magic is optional; don't block when missing
+        return True
     except Exception:
-        # If magic is unavailable or errors, don't block
+        # If magic errors for other reasons, be permissive
         return True
 
 @app.get("/", summary="API Root", tags=["Status"])
@@ -1252,9 +1323,27 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
             merged.append(c)
     return merged
 
+
+def smooth_chords(chords: List[Dict]) -> List[Dict]:
+    """Merge consecutive chord segments that have the same chord label.
+
+    This normalizes output from Madmom or fallback chorders by combining
+    adjacent segments with identical chord names into single longer segments.
+    """
+    if not chords:
+        return []
+    smoothed: List[Dict] = []
+    for chord in chords:
+        if smoothed and chord.get("chord") == smoothed[-1].get("chord"):
+            # Extend previous segment
+            smoothed[-1]["duration"] += chord.get("duration", 0)
+        else:
+            smoothed.append(dict(chord))
+    return smoothed
+
 # --- Synchronous Processing Function ---
 
-def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
+def process_audio_file_sync(tmp_path: str, debug: bool = False) -> ProcessingResult:
     """
     Orchestrator function that coordinates audio processing steps.
     Broken down into smaller, testable functions for better maintainability.
@@ -1287,17 +1376,6 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
         # Madmom chord recognition
         madmom_chords = detect_chords_madmom(tmp_path)
         # Smoothing for Madmom chords (merge consecutive same-chord segments)
-        def smooth_chords(chords):
-            if not chords:
-                return []
-            smoothed = []
-            for chord in chords:
-                if smoothed and chord["chord"] == smoothed[-1]["chord"]:
-                    # Extend previous segment
-                    smoothed[-1]["duration"] += chord["duration"]
-                else:
-                    smoothed.append(dict(chord))
-            return smoothed
         madmom_chords_smoothed = smooth_chords(madmom_chords)
         chords_list = madmom_chords_smoothed if madmom_chords_smoothed else transcription_data.get("chords", [])
         fallback_chords = None
@@ -1318,7 +1396,7 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
             "tempo": transcription_data.get("tempo"),
         }
         # Optionally add debug info if requested (see /transcribe endpoint)
-        if hasattr(process_audio_file_sync, "_debug") and process_audio_file_sync._debug:
+        if debug:
             result["debug"] = {
                 "analysis_sr": sr,
                 "downmixed": True,
@@ -1531,6 +1609,8 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
     "/transcribe",
     summary="Transcribe Audio File",
     tags=["Transcription"],
+    response_model=TranscribeResponse,
+    response_model_exclude_none=True,
     dependencies=[Depends(check_dependencies)], # Protects the endpoint if dependencies are missing
 )
 @limiter.limit("5/minute")
@@ -1620,110 +1700,6 @@ async def transcribe_audio(
     except HTTPException:
         raise
     except AudioProcessingError:
-        metrics.record_error(endpoint_name, "processing_error")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in transcribe_audio: {e}", exc_info=True)
-        metrics.record_error(endpoint_name, "unexpected_error")
-        raise AudioProcessingError(f"Transcription failed: {e}") from e
-
-    try:
-        # Use context manager for automatic file cleanup
-        async with temporary_audio_file(file) as tmp_path:
-            logger.info(f"File '{file.filename}' saved using context manager. Memory usage: {get_memory_usage():.1f}MB")
-            # Now that we have a file on disk, enforce max size & estimate memory.
-            file_size_bytes = os.path.getsize(tmp_path)
-            file_size_mb = file_size_bytes / (1024 * 1024)
-            if file_size_mb > config.MAX_FILE_SIZE_MB:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File is too large ({file_size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB."
-                )
-            # Optional content sniff (best effort)
-            if not _is_audio_by_ffprobe(tmp_path):
-                raise HTTPException(status_code=415, detail="Uploaded file does not appear to be an audio file.")
-            estimated_memory = file_size_mb * 4  # conservative
-            # read plan memory from env (e.g., 8192 on paid plan) for accurate gating
-            railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "8192"))
-            if estimated_memory > railway_memory_limit * 0.8:
-                logger.warning(f"File {file.filename} ~{estimated_memory:.2f}MB est. memory (close to limit)")
-            if not check_memory_availability(estimated_memory):
-                metrics.record_error(endpoint_name, "insufficient_memory")
-                raise HTTPException(
-                    status_code=507,
-                    detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later."
-                )
-            
-            # Cache check (same file re-uploaded)
-            if config.cache_enabled:
-                fhash = get_file_hash(tmp_path)
-                cached = request.app.state.cache.get(fhash)
-                if cached:
-                    logger.info(f"Returning cached result for '{file.filename}'")
-                    metrics.record_processing_time(endpoint_name, 0.0)
-                    return cached
-
-            # Normalize/trim to analysis-ready WAV so ML gets consistent input (matches YT/URL paths)
-            norm_wav = await _prepare_audio(tmp_path)
-            
-            try:
-                # Run the blocking, CPU-intensive function in the thread pool with timeout
-                executor = request.app.state.executor
-                loop = asyncio.get_running_loop()
-                
-                # Add timeout to prevent Railway from timing out
-                try:
-                    processing_result_dict = await asyncio.wait_for(
-                        loop.run_in_executor(executor, process_audio_file_sync, norm_wav),
-                        timeout=config.PROCESSING_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"Audio processing timed out after {config.PROCESSING_TIMEOUT} seconds for file: {file.filename}")
-                    metrics.record_error(endpoint_name, "timeout")
-                    raise ProcessingTimeoutError(f"Timed out after {config.PROCESSING_TIMEOUT}s")
-            finally:
-                # Clean up normalized WAV file
-                if norm_wav and os.path.exists(norm_wav):
-                    try:
-                        os.unlink(norm_wav)
-                    except Exception:
-                        pass
-            
-            processing_time = time.time() - start_time
-            logger.info(f"Successfully processed '{file.filename}' in {processing_time:.2f}s. Final memory usage: {get_memory_usage():.1f}MB")
-
-            # Record successful processing time using injected metrics
-            metrics.record_processing_time(endpoint_name, processing_time)
-
-            # Build a flat response the frontend can consume directly
-            tempo_data = processing_result_dict.get("tempo")
-            response = {
-                "metadata": {
-                    "filename": file.filename,
-                    "processingTime": processing_time,
-                    **processing_result_dict.get("metadata", {}),
-                },
-                "chords": processing_result_dict.get("chords", []),
-                "melody": processing_result_dict.get("melody", []),
-                # accept dict tempo or a single bpm value
-                "tempo": tempo_data if isinstance(tempo_data, dict)
-                         else ({"bpm": tempo_data} if tempo_data else None),
-            }
-            
-            # Cache store
-            if config.cache_enabled:
-                try:
-                    request.app.state.cache.set(fhash, response)
-                except Exception:
-                    pass
-            return response
-            
-        # File automatically cleaned up by context manager
-
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is (already recorded above)
-        raise
-    except AudioProcessingError as e:
         metrics.record_error(endpoint_name, "processing_error")
         raise
     except Exception as e:
