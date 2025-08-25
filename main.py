@@ -1,3 +1,48 @@
+def _normalize_madmom_label(label: str) -> Optional[str]:
+    lbl = str(label)
+    if lbl in ("N", "X", "no_chord"):
+        return None
+    if ":" not in lbl:
+        return lbl  # already simple
+    root, qual = lbl.split(":", 1)
+    q = qual.lower()
+    if q.startswith("maj"):
+        return root
+    if q.startswith("min"):
+        return f"{root}m"
+    if q.startswith("dim"):
+        return f"{root}dim"
+    if q.startswith("aug"):
+        return f"{root}aug"
+    if q.startswith("sus2"):
+        return f"{root}sus2"
+    if q.startswith("sus4"):
+        return f"{root}sus4"
+    if q.startswith("maj7"):
+        return f"{root}maj7"
+    if q.startswith("min7"):
+        return f"{root}m7"
+    if q.startswith("7"):
+        return f"{root}7"
+    return f"{root}:{qual}"
+# --- Madmom Chord Recognition Integration ---
+def detect_chords_madmom(audio_path: str):
+    """Use Madmom's state-of-the-art chord detection with label normalization."""
+    try:
+        from madmom.features.chords import CNNChordFeatureProcessor, CRFChordRecognitionProcessor
+        feats = CNNChordFeatureProcessor()(audio_path)
+        segs = CRFChordRecognitionProcessor()(feats)
+        out = []
+        for start, end, label in segs:
+            name = _normalize_madmom_label(label)
+            if not name:
+                continue
+            out.append({"time": float(start), "duration": float(end - start), "chord": name})
+        return out
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Madmom chord detection failed: {e}")
+        return []
+
 import os
 import tempfile
 import base64
@@ -16,6 +61,44 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 import hashlib
 from contextvars import ContextVar
+
+# --- Import helpers for file handling and hashing ---
+try:
+    from .file_utils import temporary_audio_file, get_file_hash
+except ImportError:
+    # fallback for monolithic file or if not present
+    import aiofiles
+from contextlib import asynccontextmanager
+import aiofiles
+@asynccontextmanager
+async def temporary_audio_file(file):
+    suffix = Path(file.filename).suffix
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        await file.seek(0)
+        async with aiofiles.open(tmp_path, 'wb') as out:
+            while chunk := await file.read(1024 * 1024):
+                await out.write(chunk)
+        yield tmp_path
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    def get_file_hash(path):
+        """Return SHA256 hash of a file."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+# --- Handle optional madmom import gracefully ---
+try:
+    import madmom
+except ImportError:
+    madmom = None
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,11 +129,12 @@ except ImportError:
     PSUTIL_AVAILABLE = False
     psutil = None
 
-# Runtime-safe import of the processing helper
+# Runtime-safe import of the processing helper, with explicit logging
 try:
     from transcription_utils import process_basic_pitch_output  # real implementation
-except Exception:
-    # Minimal no-op fallback to keep the endpoint from crashing during setup
+    logging.getLogger(__name__).info("Using real process_basic_pitch_output from transcription_utils.")
+except Exception as e:
+    logging.getLogger(__name__).warning(f"Using fallback process_basic_pitch_output (no-op) — accuracy will be poor. Import error: {e}")
     def process_basic_pitch_output(model_output, midi_data, note_events, sr, duration):
         return {"chords": [], "melody": [], "tempo": None}
 
@@ -71,16 +155,13 @@ ALLOWED_MIME_TYPES = {
     '.ogg': ['audio/ogg', 'application/ogg', 'application/octet-stream']
 }
 
-# Audio preprocessing defaults (configurable via env)
-TARGET_SR = int(os.getenv("AUDIO_TARGET_SR", "22050"))  # set to 16000 to test lower SR
-# Keep a hard server-side cap; trim with ffmpeg to avoid huge arrays in Python
+# Audio preprocessing defaults (pin sample rate to 22050 for best accuracy)
+TARGET_SR = 22050  # Pin to 22050 for Basic Pitch accuracy
 MAX_AUDIO_DURATION_S = int(os.getenv("MAX_AUDIO_SECONDS", "900"))  # 15 minutes
 
 # Validate/sanitize caps
 if MAX_AUDIO_DURATION_S <= 0:
     MAX_AUDIO_DURATION_S = 900
-if TARGET_SR not in (16000, 22050, 24000, 32000, 44100):
-    TARGET_SR = 22050
 
 # --- Memory Management Utilities ---
 def get_memory_usage() -> float:
@@ -145,72 +226,9 @@ class SimpleMetrics:
             "current_memory_usage_mb": get_memory_usage() if PSUTIL_AVAILABLE else None
         }
 
-# --- Simple TTL Cache (no extra dependency) ---
-class SimpleTTLCache:
-    def __init__(self, maxsize: int = 50, ttl: int = 3600):
-        self.maxsize = maxsize
-        self.ttl = ttl
-        self._data: dict[str, tuple[float, dict]] = {}
 
-    def _evict_if_needed(self):
-        if len(self._data) <= self.maxsize:
-            return
-        # Evict oldest by expiry time
-        oldest_key = min(self._data.keys(), key=lambda k: self._data[k][0])
-        self._data.pop(oldest_key, None)
+# --- Audio Processing Orchestrator ---
 
-    def get(self, key: str) -> Optional[dict]:
-        item = self._data.get(key)
-        if not item:
-            return None
-        expires_at, value = item
-        if time.time() > expires_at:
-            self._data.pop(key, None)
-            return None
-        return value
-
-    def set(self, key: str, value: dict):
-        self._data[key] = (time.time() + self.ttl, value)
-        self._evict_if_needed()
-
-def get_file_hash(file_path: str) -> str:
-    hasher = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-# --- File Management Utilities ---
-@asynccontextmanager
-async def temporary_audio_file(file: UploadFile):
-    """Context manager for temporary file handling with automatic cleanup"""
-    tmp_path = None
-    try:
-        # Create temp file
-        suffix = Path(file.filename).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            tmp_path = tmp_file.name
-            
-        # Stream file content efficiently
-        await file.seek(0)
-        async with aiofiles.open(tmp_path, 'wb') as out_file:
-            total = 0
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                total += len(chunk)
-                if total > (config.MAX_FILE_SIZE + 1024 * 1024):
-                    raise HTTPException(status_code=413, detail="File too large.")
-                await out_file.write(chunk)
-                
-        logger.debug(f"Temporary file created: {tmp_path}")
-        yield tmp_path
-        
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-                logger.debug(f"Cleaned up temporary file: {tmp_path}")
-            except Exception as e:
-                logger.error(f"Failed to cleanup {tmp_path}: {e}")
 
 # --- Configure Logging ---
 # Initialize config first to get LOG_LEVEL
@@ -754,6 +772,35 @@ def _job_payload(job, include_result: bool = True) -> dict:
 
 # Initialize metrics collection
 app.state.metrics = SimpleMetrics()
+
+# --- SimpleTTLCache import (fallback if not available as a module) ---
+try:
+    from simple_ttl_cache import SimpleTTLCache
+except ImportError:
+    import threading, time
+    class SimpleTTLCache:
+        def __init__(self, maxsize=50, ttl=3600):
+            self.maxsize = maxsize
+            self.ttl = ttl
+            self._cache = {}
+            self._lock = threading.Lock()
+        def get(self, key):
+            with self._lock:
+                v = self._cache.get(key)
+                if v is None:
+                    return None
+                value, expires = v
+                if expires < time.time():
+                    del self._cache[key]
+                    return None
+                return value
+        def set(self, key, value):
+            with self._lock:
+                if len(self._cache) >= self.maxsize:
+                    # Remove oldest
+                    oldest = min(self._cache.items(), key=lambda item: item[1][1])[0]
+                    del self._cache[oldest]
+                self._cache[key] = (value, time.time() + self.ttl)
 app.state.cache = SimpleTTLCache(maxsize=config.CACHE_MAX_ITEMS, ttl=config.CACHE_TTL_SECONDS)
 
 # --- Request Size Limit Middleware ---
@@ -1159,32 +1206,35 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
     Looks at active notes in fixed windows, selects a root by mode,
     and labels crude maj/min triads. Merges consecutive duplicates.
     """
+    # Improved fallback chord detection: shorter window, note duration weighting
     try:
-        import numpy as np  # Lazy import to reduce startup memory
+        import numpy as np
     except Exception:
         return []
     if not events or duration <= 0:
         return []
     pc_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-    def _note_range(ev):
-        st = ev.get("start_time") or ev.get("onset_time") or 0.0
-        en = ev.get("end_time") or ev.get("offset_time") or 0.0
-        return float(st), float(en)
-    def _midi_pc(ev):
-        midi = ev.get("midi_note") or ev.get("pitch") or 60
-        return int(midi) % 12
     chords_out: List[Dict] = []
     t = 0.0
+    # window param is now respected from caller
     while t < max(duration, 1e-3):
         t_end = min(t + window, duration)
+        # Weight pitch classes by note duration in window
         pcs: List[int] = []
-        mid = (t + t_end) * 0.5
+        weights: List[float] = []
         for ev in events:
-            st, en = _note_range(ev)
-            if st <= mid <= en:
-                pcs.append(_midi_pc(ev))
+            st = float(ev.get("start_time") or ev.get("onset_time") or 0.0)
+            en = float(ev.get("end_time") or ev.get("offset_time") or 0.0)
+            midi = int(ev.get("midi_note") or ev.get("pitch") or 60)
+            pc = midi % 12
+            overlap = max(0.0, min(t_end, en) - max(t, st))
+            if overlap > 0:
+                pcs.append(pc)
+                weights.append(overlap)
         if pcs:
-            hist = np.bincount(pcs, minlength=12)
+            hist = np.zeros(12)
+            for pc, w in zip(pcs, weights):
+                hist[pc] += w
             root = int(hist.argmax())
             has_m3 = hist[(root + 3) % 12]
             has_M3 = hist[(root + 4) % 12]
@@ -1214,52 +1264,73 @@ def process_audio_file_sync(tmp_path: str) -> ProcessingResult:
     
     try:
         logger.info(f"Starting audio processing at path: {tmp_path}")
-        
         # Check file size before processing
         file_size = os.path.getsize(tmp_path)
         logger.info(f"File size: {file_size / (1024*1024):.2f} MB")
-        
         # Force garbage collection before starting
         gc.collect()
-        
         # Load audio file
         audio, sr, duration = load_audio_file(tmp_path)
-        
-        # Free memory immediately after getting duration info
-        del audio
-        gc.collect()
-        
+        logger.info(f"Loaded audio: duration={duration:.2f}s, sample_rate={sr}Hz, shape={getattr(audio, 'shape', None)}")
+        note_count = None
+        first_notes = None
         # Run basic-pitch prediction
         model_output, midi_data, note_events = run_basic_pitch_prediction(tmp_path)
-        
+        note_count = len(note_events) if note_events is not None else 0
+        first_notes = note_events[:5] if note_events else []
         # Process the output
         logger.info("Processing basic-pitch output...")
         transcription_data = process_basic_pitch_output(
             model_output, midi_data, note_events, sr, duration
         )
         logger.info("Processing complete, returning results...")
-        
-        # If helper returned no chords, apply a naïve, safe fallback from note events
-        chords_list = transcription_data.get("chords", [])
+        # Madmom chord recognition
+        madmom_chords = detect_chords_madmom(tmp_path)
+        # Smoothing for Madmom chords (merge consecutive same-chord segments)
+        def smooth_chords(chords):
+            if not chords:
+                return []
+            smoothed = []
+            for chord in chords:
+                if smoothed and chord["chord"] == smoothed[-1]["chord"]:
+                    # Extend previous segment
+                    smoothed[-1]["duration"] += chord["duration"]
+                else:
+                    smoothed.append(dict(chord))
+            return smoothed
+        madmom_chords_smoothed = smooth_chords(madmom_chords)
+        chords_list = madmom_chords_smoothed if madmom_chords_smoothed else transcription_data.get("chords", [])
+        fallback_chords = None
         if not chords_list:
-            chords_list = get_naive_chords_from_notes(note_events, duration, window=1.0)
-
+            logger.warning("No chords from Madmom or process_basic_pitch_output, using improved fallback chorder (window=0.4s, duration-weighted)")
+            chords_list = get_naive_chords_from_notes(note_events, duration, window=0.4)
+            fallback_chords = chords_list
+        else:
+            fallback_chords = get_naive_chords_from_notes(note_events, duration, window=0.4)
         # Clean up intermediate data after potential fallback
-        del model_output, midi_data, note_events
+        del model_output, midi_data, note_events, audio
         gc.collect()
-
         # Return a dictionary with the core results
-        return {
+        result = {
             "metadata": {"duration": duration, "sampleRate": sr},
             "chords": chords_list,
             "melody": transcription_data.get("melody", []),
             "tempo": transcription_data.get("tempo"),
         }
+        # Optionally add debug info if requested (see /transcribe endpoint)
+        if hasattr(process_audio_file_sync, "_debug") and process_audio_file_sync._debug:
+            result["debug"] = {
+                "analysis_sr": sr,
+                "downmixed": True,
+                "note_count": note_count,
+                "first_note_events": first_notes,
+                "madmom_chords": madmom_chords,
+                "fallback_chords": fallback_chords,
+            }
+        return result
     except Exception as e:
         logger.error(f"Core audio processing failed: {e}", exc_info=True)
-        # Force garbage collection on error
         gc.collect()
-        # Wrap the original exception in our custom error type
         raise AudioProcessingError(f"Processing failed: {e}") from e
 
 @app.post("/test-minimal-processing", 
@@ -1464,19 +1535,97 @@ async def transcribe_status(request: Request, file: UploadFile = Depends(validat
 )
 @limiter.limit("5/minute")
 async def transcribe_audio(
-    request: Request, 
+    request: Request,
     file: UploadFile = Depends(validate_file),
-    metrics: SimpleMetrics = Depends(get_metrics_collector)
+    metrics: SimpleMetrics = Depends(get_metrics_collector),
 ):
     """
     Accepts an audio file, transcribes it to find chords and melody,
-    and returns the structured data.
+    and returns the structured data. Optional query param: debug=true to include extra analysis info.
     """
+    import time, os
     start_time = time.time()
     endpoint_name = "transcribe"
-    
-    # Record request using injected metrics
     metrics.record_request(endpoint_name)
+    debug = request.query_params.get("debug", "false").lower() == "true"
+    try:
+        async with temporary_audio_file(file) as tmp_path:
+            file_size_bytes = os.path.getsize(tmp_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            if file_size_mb > config.MAX_FILE_SIZE_MB:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File is too large ({file_size_mb:.2f}MB). Maximum size is {config.MAX_FILE_SIZE_MB}MB.",
+                )
+
+            if not _is_audio_by_ffprobe(tmp_path):
+                raise HTTPException(status_code=415, detail="Uploaded file does not appear to be an audio file.")
+
+            estimated_memory = file_size_mb * 4  # conservative
+            railway_memory_limit = int(os.getenv("RAILWAY_RAM_MB", "8192"))
+            if estimated_memory > railway_memory_limit * 0.8:
+                logger.warning(f"File {file.filename} ~{estimated_memory:.2f}MB est. memory (close to limit)")
+            if not check_memory_availability(estimated_memory):
+                metrics.record_error(endpoint_name, "insufficient_memory")
+                raise HTTPException(
+                    status_code=507,
+                    detail=f"Insufficient memory to process this file ({file_size_mb:.2f}MB). Try a smaller file or try again later.",
+                )
+
+            if config.cache_enabled:
+                fhash = get_file_hash(tmp_path)
+                cached = request.app.state.cache.get(fhash)
+                if cached:
+                    logger.info(f"Returning cached result for '{file.filename}'")
+                    metrics.record_processing_time(endpoint_name, 0.0)
+                    return cached
+
+            loop = asyncio.get_running_loop()
+            executor = request.app.state.executor
+            try:
+                processing_result = await asyncio.wait_for(
+                    loop.run_in_executor(executor, lambda: process_audio_file_sync(tmp_path, debug=debug)),
+                    timeout=config.PROCESSING_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                metrics.record_error(endpoint_name, "timeout")
+                raise ProcessingTimeoutError(f"Timed out after {config.PROCESSING_TIMEOUT}s")
+
+            processing_time = time.time() - start_time
+            metrics.record_processing_time(endpoint_name, processing_time)
+
+            tempo_data = processing_result.get("tempo")
+            tempo_out = tempo_data if isinstance(tempo_data, dict) else ({"bpm": tempo_data} if tempo_data else None)
+
+            response = {
+                "metadata": {
+                    "filename": file.filename,
+                    "processingTime": round(processing_time, 2),
+                    **processing_result.get("metadata", {}),
+                },
+                "chords": processing_result.get("chords", []),
+                "melody": processing_result.get("melody", []),
+                "tempo": tempo_out,
+            }
+            if debug and "debug" in processing_result:
+                response["debug"] = processing_result["debug"]
+
+            if config.cache_enabled:
+                try:
+                    request.app.state.cache.set(fhash, response)
+                except Exception:
+                    pass
+            return response
+
+    except HTTPException:
+        raise
+    except AudioProcessingError:
+        metrics.record_error(endpoint_name, "processing_error")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in transcribe_audio: {e}", exc_info=True)
+        metrics.record_error(endpoint_name, "unexpected_error")
+        raise AudioProcessingError(f"Transcription failed: {e}") from e
 
     try:
         # Use context manager for automatic file cleanup
