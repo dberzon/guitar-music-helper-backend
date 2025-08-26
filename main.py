@@ -921,6 +921,24 @@ app.add_middleware(
     max_age=600,
 )
 
+
+# Fallback middleware: ensure Access-Control-Allow-Origin is always present on responses.
+# This helps when an exception handler or other path returns a response without CORS headers
+# (some hosting environments may short-circuit middleware in error paths).
+@app.middleware("http")
+async def ensure_cors_header(request: Request, call_next):
+    response = await call_next(request)
+    # If CORS middleware already set the header, leave it alone. Otherwise set a sensible default.
+    hdrs = {k.lower(): v for k, v in response.headers.items()}
+    if "access-control-allow-origin" not in hdrs:
+        try:
+            # Prefer explicit configured origins (first one) to be secure in production
+            origins = config.CORS_ORIGINS or []
+            response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
+        except Exception:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
 # --- Exception Handlers ---
 # These handlers ensure that clients always receive a consistent,
 # structured JSON error response.
