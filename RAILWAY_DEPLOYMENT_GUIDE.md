@@ -73,3 +73,69 @@ Note: 50MB files will require significant memory for processing:
 - Estimated memory usage: ~200MB per file
 - Railway Hobby plan has ~512MB total memory
 - Consider upgrading Railway plan for consistent large file processing
+
+---
+
+## Madmom build quirks and Dockerfile recommendation
+
+Madmom (used for chord recognition) runs build-time steps that require Cython
+and a compatible NumPy to be present before madmom is built. On Railway the
+default `pip install -r requirements.txt` can fail with:
+
+```
+ModuleNotFoundError: No module named 'Cython'
+metadata-generation-failed
+```
+
+To avoid this, build madmom in a controlled order inside a Dockerfile where
+you first install OS build tools and ffmpeg/libsndfile, then preinstall
+Cython/NumPy/Scipy/mido, install madmom (we recommend installing from Git),
+and finally install the rest of the requirements.
+
+Add the following Dockerfile (or update your existing one) in
+`guitar-music-helper-backend/Dockerfile`:
+
+```dockerfile
+FROM python:3.11-slim-bullseye
+
+RUN apt-get update \
+      && apt-get install -y --no-install-recommends \
+          build-essential ffmpeg libsndfile1 git \
+      && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt ./requirements.txt
+
+RUN python -m venv --copies /opt/venv \
+ && . /opt/venv/bin/activate \
+ && pip install --upgrade pip setuptools wheel \
+ && pip install "Cython<3" "numpy==1.26.4" "scipy==1.10.1" mido \
+ && pip install --no-build-isolation "madmom @ git+https://github.com/CPJKU/madmom.git" \
+ && pip install -r requirements.txt
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+COPY . /app
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Notes:
+- We use `--no-build-isolation` so the preinstalled Cython/NumPy in the venv
+   are visible to madmom's build step.
+- Installing madmom from the Git repository is recommended because the PyPI
+   release (0.16.1) is older and sometimes incompatible with newer Python
+   or NumPy releases.
+
+### Validation (after deploy)
+After Railway builds the Docker image, open a shell in the container and run:
+
+```bash
+. /opt/venv/bin/activate
+python -c "import madmom, numpy as np; print('madmom OK', getattr(madmom,'__version__','(no __version__)'), np.__version__)"
+ffmpeg -version | head -n1
+```
+
+You should see `madmom OK` and an ffmpeg version line if the build succeeded.
+

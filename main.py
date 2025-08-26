@@ -3,6 +3,8 @@ import logging
 # Module-level logger for consistent logging across the module
 logger = logging.getLogger(__name__)
 
+from typing import Optional
+
 
 def _normalize_madmom_label(label: str) -> Optional[str]:
     lbl = str(label)

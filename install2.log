@@ -1,0 +1,64 @@
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Collecting fastapi==0.104.1 (from -r requirements.txt (line 1))
+  Downloading fastapi-0.104.1-py3-none-any.whl.metadata (24 kB)
+Collecting uvicorn==0.24.0 (from uvicorn[standard]==0.24.0->-r requirements.txt (line 2))
+  Downloading uvicorn-0.24.0-py3-none-any.whl.metadata (6.4 kB)
+Collecting gunicorn==21.2.0 (from -r requirements.txt (line 3))
+  Downloading gunicorn-21.2.0-py3-none-any.whl.metadata (4.1 kB)
+Collecting python-multipart==0.0.6 (from -r requirements.txt (line 4))
+  Downloading python_multipart-0.0.6-py3-none-any.whl.metadata (2.5 kB)
+Collecting basic-pitch==0.2.5 (from -r requirements.txt (line 5))
+  Downloading basic_pitch-0.2.5-py2.py3-none-any.whl.metadata (1.9 kB)
+Collecting librosa==0.10.1 (from -r requirements.txt (line 6))
+  Downloading librosa-0.10.1-py3-none-any.whl.metadata (8.3 kB)
+Collecting soundfile==0.12.1 (from -r requirements.txt (line 7))
+  Downloading soundfile-0.12.1-py2.py3-none-win_amd64.whl.metadata (14 kB)
+Collecting numpy==1.23.5 (from -r requirements.txt (line 8))
+  Downloading numpy-1.23.5-cp310-cp310-win_amd64.whl.metadata (2.3 kB)
+Collecting pydantic==2.5.0 (from -r requirements.txt (line 9))
+  Downloading pydantic-2.5.0-py3-none-any.whl.metadata (174 kB)
+Collecting pydantic-settings==2.1.0 (from -r requirements.txt (line 10))
+  Downloading pydantic_settings-2.1.0-py3-none-any.whl.metadata (2.9 kB)
+Collecting python-dotenv==1.0.0 (from -r requirements.txt (line 11))
+  Downloading python_dotenv-1.0.0-py3-none-any.whl.metadata (21 kB)
+Collecting aiofiles==23.2.1 (from -r requirements.txt (line 12))
+  Downloading aiofiles-23.2.1-py3-none-any.whl.metadata (9.7 kB)
+Collecting slowapi==0.1.9 (from -r requirements.txt (line 13))
+  Downloading slowapi-0.1.9-py3-none-any.whl.metadata (3.0 kB)
+Collecting psutil==5.9.6 (from -r requirements.txt (line 14))
+  Downloading psutil-5.9.6-cp37-abi3-win_amd64.whl.metadata (22 kB)
+Collecting rq==1.16.2 (from -r requirements.txt (line 16))
+  Downloading rq-1.16.2-py3-none-any.whl.metadata (5.7 kB)
+Collecting redis==5.0.7 (from -r requirements.txt (line 17))
+  Downloading redis-5.0.7-py3-none-any.whl.metadata (9.3 kB)
+Collecting ffmpeg-python==0.2.0 (from -r requirements.txt (line 18))
+  Downloading ffmpeg_python-0.2.0-py3-none-any.whl.metadata (1.7 kB)
+Collecting supabase==2.6.0 (from -r requirements.txt (line 19))
+  Downloading supabase-2.6.0-py3-none-any.whl.metadata (9.3 kB)
+Collecting madmom==0.16.1 (from -r requirements.txt (line 22))
+  Downloading madmom-0.16.1.tar.gz (20.0 MB)
+  Preparing metadata (setup.py): started
+  Preparing metadata (setup.py): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  python setup.py egg_info did not run successfully.
+  exit code: 1
+  
+  [6 lines of output]
+  Traceback (most recent call last):
+    File "<string>", line 2, in <module>
+    File "<pip-setuptools-caller>", line 35, in <module>
+    File "C:\Users\berzo\AppData\Local\Temp\pip-install-o4jm84s3\madmom_87f400fb3c444c468a150ba0ea32280f\setup.py", line 15, in <module>
+      import numpy as np
+  ModuleNotFoundError: No module named 'numpy'
+  [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: metadata-generation-failed
+
+Encountered error while generating package metadata.
+
+See above for output.
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.
