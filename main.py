@@ -1284,11 +1284,34 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
         import numpy as np
     except Exception:
         return []
+
     if not events or duration <= 0:
         return []
+
     pc_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
     chords_out: List[Dict] = []
     t = 0.0
+
+    def _unpack_event(ev) -> tuple[float, float, int]:
+        """Return (start, end, midi) from either a dict-like event or a tuple/list event."""
+        if isinstance(ev, (list, tuple)):
+            # basic-pitch note tuple: (start, end, pitch, amplitude, ...)
+            try:
+                st = float(ev[0])
+                en = float(ev[1])
+                midi = int(ev[2])
+            except Exception:
+                return 0.0, 0.0, 60
+            return st, en, midi
+        # dict-like event
+        try:
+            st = float(ev.get("start_time") or ev.get("onset_time") or 0.0)
+            en = float(ev.get("end_time") or ev.get("offset_time") or 0.0)
+            midi = int(ev.get("midi_note") or ev.get("pitch") or 60)
+        except Exception:
+            return 0.0, 0.0, 60
+        return st, en, midi
+
     # window param is now respected from caller
     while t < max(duration, 1e-3):
         t_end = min(t + window, duration)
@@ -1296,14 +1319,13 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
         pcs: List[int] = []
         weights: List[float] = []
         for ev in events:
-            st = float(ev.get("start_time") or ev.get("onset_time") or 0.0)
-            en = float(ev.get("end_time") or ev.get("offset_time") or 0.0)
-            midi = int(ev.get("midi_note") or ev.get("pitch") or 60)
+            st, en, midi = _unpack_event(ev)
             pc = midi % 12
             overlap = max(0.0, min(t_end, en) - max(t, st))
             if overlap > 0:
                 pcs.append(pc)
                 weights.append(overlap)
+
         if pcs:
             hist = np.zeros(12)
             for pc, w in zip(pcs, weights):
@@ -1315,7 +1337,9 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
             qual = "" if (has_M3 >= has_m3 and has_P5) else "m"
             name = pc_names[root] + qual
             chords_out.append({"time": float(t), "duration": float(t_end - t), "chord": name})
+
         t = t_end
+
     # merge consecutive duplicates
     merged: List[Dict] = []
     for c in chords_out:
