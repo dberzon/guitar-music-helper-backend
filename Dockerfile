@@ -13,17 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # --- Install Python deps from requirements.txt first (layer caching) ---
+# Copy requirements early for caching, but delay the full install until after madmom
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
- && pip install --no-cache-dir -r /app/requirements.txt
 
-# --- Install madmom with its strict prerequisites (pin order matters) ---
-RUN pip install --no-cache-dir \
-      numpy==1.26.4 \
-      scipy==1.10.1 \
-      cython==0.29.37 \
-      mido==1.3.2 \
- && pip install --no-cache-dir madmom==0.16.1
+# Preinstall madmom and its strict build-time prerequisites in a controlled order
+# to avoid pip build-isolation metadata-generation failures and dependency conflicts
+RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
+ && pip install --no-cache-dir \
+     cython==0.29.37 \
+     numpy==1.23.5 \
+     scipy==1.10.1 \
+     mido==1.3.2 \
+ && pip install --no-cache-dir madmom==0.16.1 \
+ && pip install --no-cache-dir -r /app/requirements.txt
 
 # --- Copy application source ---
 COPY . /app
