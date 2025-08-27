@@ -174,7 +174,26 @@ try:
 except (ImportError, ModuleNotFoundError) as e:
     logger.warning(f"Using fallback process_basic_pitch_output (no-op) — accuracy will be poor. Import error: {e}")
     def process_basic_pitch_output(model_output, midi_data, note_events, sr, duration):
-        return {"chords": [], "melody": [], "tempo": None}
+        # Simple tempo estimation from note events
+        tempo_bpm = None
+        if note_events and len(note_events) > 1:
+            # Calculate average time between note onsets
+            times = [note.start for note in note_events]
+            times.sort()
+            intervals = [times[i+1] - times[i] for i in range(len(times)-1) if times[i+1] - times[i] > 0.1]  # Filter out very short intervals
+            if intervals:
+                avg_interval = sum(intervals) / len(intervals)
+                # Estimate BPM assuming quarter note intervals (rough estimation)
+                tempo_bpm = 60.0 / avg_interval if avg_interval > 0 else None
+                # Clamp to reasonable range
+                if tempo_bpm:
+                    tempo_bpm = max(60, min(200, tempo_bpm))
+        
+        return {
+            "chords": [], 
+            "melody": [], 
+            "tempo": {"bpm": tempo_bpm} if tempo_bpm else None
+        }
 
 # --- Types ---
 class ProcessingResult(TypedDict):
@@ -1838,6 +1857,18 @@ async def transcribe_audio(
                         "start": start_time,
                         "end": end_time,
                         "label": chord.get("chord", chord.get("label", "Unknown"))
+                    }
+                    transformed_chords.append(transformed_chord)
+                elif hasattr(chord, 'time') and hasattr(chord, 'duration') and hasattr(chord, 'chord'):
+                    # Handle TranscriptionChord objects
+                    start_time = chord.time
+                    duration = chord.duration
+                    end_time = start_time + duration
+                    
+                    transformed_chord = {
+                        "start": start_time,
+                        "end": end_time,
+                        "label": chord.chord
                     }
                     transformed_chords.append(transformed_chord)
             
