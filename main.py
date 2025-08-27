@@ -1811,25 +1811,38 @@ async def transcribe_audio(
             metrics.record_processing_time(endpoint_name, processing_time)
 
             tempo_data = processing_result.get("tempo")
+            logger.info(f"Processing result keys: {list(processing_result.keys())}")
+            logger.info(f"Tempo data: {tempo_data}")
+            
             # Extract BPM for frontend compatibility
             bpm = None
             if isinstance(tempo_data, dict):
                 bpm = tempo_data.get("bpm")
             elif isinstance(tempo_data, (int, float)):
                 bpm = tempo_data
+            
+            logger.info(f"Extracted BPM: {bpm}")
 
             # Transform chords to match frontend expectations
             chords_data = processing_result.get("chords", [])
+            logger.info(f"Raw chords data (first 3): {chords_data[:3] if chords_data else 'No chords'}")
             transformed_chords = []
             for chord in chords_data:
                 if isinstance(chord, dict):
                     # Convert backend format to frontend format
+                    start_time = chord.get("time", chord.get("start", 0))
+                    duration = chord.get("duration", 1.0)
+                    end_time = start_time + duration
+                    
                     transformed_chord = {
-                        "start": chord.get("time", chord.get("start", 0)),
-                        "end": chord.get("time", chord.get("start", 0)) + chord.get("duration", 1),
+                        "start": start_time,
+                        "end": end_time,
                         "label": chord.get("chord", chord.get("label", "Unknown"))
                     }
                     transformed_chords.append(transformed_chord)
+            
+            logger.info(f"Transformed chords count: {len(transformed_chords)}")
+            logger.info(f"Transformed chords (first 3): {transformed_chords[:3] if transformed_chords else 'No chords'}")
 
             # Frontend-compatible response format
             response = {
