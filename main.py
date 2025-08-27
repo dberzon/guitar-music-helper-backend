@@ -1811,17 +1811,39 @@ async def transcribe_audio(
             metrics.record_processing_time(endpoint_name, processing_time)
 
             tempo_data = processing_result.get("tempo")
-            tempo_out = tempo_data if isinstance(tempo_data, dict) else ({"bpm": tempo_data} if tempo_data else None)
+            # Extract BPM for frontend compatibility
+            bpm = None
+            if isinstance(tempo_data, dict):
+                bpm = tempo_data.get("bpm")
+            elif isinstance(tempo_data, (int, float)):
+                bpm = tempo_data
 
+            # Transform chords to match frontend expectations
+            chords_data = processing_result.get("chords", [])
+            transformed_chords = []
+            for chord in chords_data:
+                if isinstance(chord, dict):
+                    # Convert backend format to frontend format
+                    transformed_chord = {
+                        "start": chord.get("time", chord.get("start", 0)),
+                        "end": chord.get("time", chord.get("start", 0)) + chord.get("duration", 1),
+                        "label": chord.get("chord", chord.get("label", "Unknown"))
+                    }
+                    transformed_chords.append(transformed_chord)
+
+            # Frontend-compatible response format
             response = {
+                "bpm": bpm,
+                "key": "C major",  # TODO: Extract from processing result when available
+                "key_changes": [],  # TODO: Extract from processing result when available
+                "chords": transformed_chords,
                 "metadata": {
                     "filename": file.filename,
                     "processingTime": round(processing_time, 2),
                     **processing_result.get("metadata", {}),
                 },
-                "chords": processing_result.get("chords", []),
                 "melody": processing_result.get("melody", []),
-                "tempo": tempo_out,
+                "tempo": tempo_data,  # Keep original tempo data for compatibility
             }
             if debug and "debug" in processing_result:
                 response["debug"] = processing_result["debug"]
