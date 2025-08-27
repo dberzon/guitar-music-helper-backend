@@ -387,6 +387,9 @@ class Config(BaseSettings):
 
 config = Config()
 
+# Update the CORS_ORIGINS to include the Railway production URL
+config.CORS_ORIGINS.append("https://web-production-84b20.up.railway.app")
+
 # --- Error types and dependency flags (minimal definitions) ---
 class AudioProcessingError(Exception):
     pass
