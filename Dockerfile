@@ -38,4 +38,5 @@ ENV PORT=8080 \
 EXPOSE 8080
 
 # --- Start FastAPI with Gunicorn + Uvicorn worker ---
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "-b", "0.0.0.0:${PORT}", "main:app"]
+# Shell form so $PORT expands (Railway provides it)
+CMD ["sh", "-c", "gunicorn -k uvicorn.workers.UvicornWorker -w ${WORKERS:-1} -b 0.0.0.0:${PORT:-8080} main:app"]
