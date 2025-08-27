@@ -2,6 +2,7 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 gunicorn==21.2.0
 python-multipart==0.0.6
+requests
 basic-pitch==0.2.5
 librosa==0.10.1
 soundfile==0.12.1  # libsndfile-backed I/O for librosa; avoids audioread edge cases
