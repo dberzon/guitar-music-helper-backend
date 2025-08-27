@@ -332,7 +332,7 @@ class Config(BaseSettings):
         description="List of allowed CORS origins"
     )
     CORS_ORIGIN_REGEX: str | None = Field(
-        default=r"^https://guitar-music-helper-[a-z0-9]+-dberzons-projects\.vercel\.app$",
+        default=r"^https://.*-dberzon-projects\.vercel\.app$",
         description="Regex for Vercel preview deployments"
     )
     
@@ -922,6 +922,9 @@ app.add_middleware(
     max_age=600,
 )
 
+# Update the CORS_ORIGIN_REGEX to allow any URL ending with -dberzon-projects.vercel.app
+config.CORS_ORIGIN_REGEX = r"^https://.*-dberzon-projects\.vercel\.app$"
+
 
 # Fallback middleware: ensure Access-Control-Allow-Origin is always present on responses.
 # This helps when an exception handler or other path returns a response without CORS headers
@@ -1363,6 +1366,7 @@ def get_naive_chords_from_notes(events: List[dict], duration: float, window: flo
     merged: List[Dict] = []
     for c in chords_out:
         if merged and merged[-1]["chord"] == c["chord"]:
+            # Extend previous segment
             merged[-1]["duration"] += c["duration"]
         else:
             merged.append(c)
