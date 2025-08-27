@@ -914,19 +914,32 @@ async def add_request_id(request: Request, call_next):
 # Configure CORS with environment-based origins for security
 logger.info(f"🌐 CORS configured for {config.ENVIRONMENT} environment")
 
+# Simplified CORS origins list - remove trailing slashes and duplicates
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173", 
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://guitar-music-helper.vercel.app",
+    "https://web-production-84b20.up.railway.app",
+    # Add current Vercel preview domains
+    "https://guitar-music-helper-7g9fwzvch-dberzons-projects.vercel.app",
+    "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app",
+    "https://guitar-music-helper-h9i35sgkq-dberzons-projects.vercel.app"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS,
-    allow_origin_regex=config.CORS_ORIGIN_REGEX,
-    allow_credentials=True,  # Can be True now that we don't use "*"
-    allow_methods=["GET", "POST", "OPTIONS"],  # Be specific about allowed methods
+    allow_origins=origins,
+    allow_origin_regex=r"^https://.*-dberzon-projects\.vercel\.app$",
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
     max_age=600,
 )
-
-# Update the CORS_ORIGIN_REGEX to allow any URL ending with -dberzon-projects.vercel.app
-config.CORS_ORIGIN_REGEX = r"^https://.*-dberzon-projects\.vercel\.app$"
 
 
 # Fallback middleware: ensure Access-Control-Allow-Origin is always present on responses.
@@ -934,27 +947,94 @@ config.CORS_ORIGIN_REGEX = r"^https://.*-dberzon-projects\.vercel\.app$"
 # (some hosting environments may short-circuit middleware in error paths).
 @app.middleware("http")
 async def ensure_cors_header(request: Request, call_next):
-    response = await call_next(request)
-    # If CORS middleware already set the header, leave it alone. Otherwise set a sensible default.
-    hdrs = {k.lower(): v for k, v in response.headers.items()}
-    if "access-control-allow-origin" not in hdrs:
-        try:
-            # Prefer explicit configured origins (first one) to be secure in production
-            origins = config.CORS_ORIGINS or []
-            response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
-        except Exception:
-            response.headers["Access-Control-Allow-Origin"] = "*"
+    # Get the request origin
+    origin = request.headers.get("origin")
+    
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # If an unhandled error occurs, create a basic error response with CORS headers
+        from fastapi.responses import JSONResponse
+        response = JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "Internal server error"}
+        )
+    
+    # Always ensure CORS headers are present
+    if origin:
+        # Check if origin is allowed
+        allowed = False
+        for allowed_origin in config.CORS_ORIGINS:
+            if origin == allowed_origin:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                allowed = True
+                break
+        
+        # Check regex pattern if not already allowed
+        if not allowed and config.CORS_ORIGIN_REGEX:
+            import re
+            if re.match(config.CORS_ORIGIN_REGEX, origin):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                allowed = True
+        
+        # If not allowed but in development, be permissive
+        if not allowed and config.is_development:
+            response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        # No origin header, set to first allowed origin or wildcard
+        origins = config.CORS_ORIGINS or []
+        response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
+    
+    # Always add other CORS headers for preflight compatibility
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    
     return response
 
 # --- Exception Handlers ---
 # These handlers ensure that clients always receive a consistent,
 # structured JSON error response.
 
+def add_cors_headers_to_response(response: JSONResponse, request: Request):
+    """Helper function to add CORS headers to any response"""
+    origin = request.headers.get("origin")
+    
+    if origin:
+        # Check if origin is allowed
+        allowed = False
+        for allowed_origin in config.CORS_ORIGINS:
+            if origin == allowed_origin:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                allowed = True
+                break
+        
+        # Check regex pattern if not already allowed
+        if not allowed and config.CORS_ORIGIN_REGEX:
+            import re
+            if re.match(config.CORS_ORIGIN_REGEX, origin):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                allowed = True
+        
+        # If not allowed but in development, be permissive
+        if not allowed and config.is_development:
+            response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        # No origin header, set to first allowed origin or wildcard
+        origins = config.CORS_ORIGINS or []
+        response.headers["Access-Control-Allow-Origin"] = origins[0] if origins else "*"
+    
+    # Always add other CORS headers
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handles any exception not caught by more specific handlers."""
     logger.error(f"Unhandled exception for request {request.url}: {exc}", exc_info=True)
-    return JSONResponse(
+    response = JSONResponse(
         status_code=500,
         content={
             "success": False,
@@ -964,11 +1044,12 @@ async def global_exception_handler(request: Request, exc: Exception):
             },
         },
     )
+    return add_cors_headers_to_response(response, request)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handles FastAPI's built-in HTTPExceptions."""
-    return JSONResponse(
+    response = JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
@@ -979,6 +1060,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         },
         headers=exc.headers,
     )
+    return add_cors_headers_to_response(response, request)
 
 @app.exception_handler(AudioProcessingError)
 async def audio_processing_error_handler(request: Request, exc: AudioProcessingError):
@@ -988,7 +1070,7 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
     # Map timeouts to a more appropriate HTTP status
     status_code = 504 if isinstance(exc, ProcessingTimeoutError) else 422
     code = "TIMEOUT" if isinstance(exc, ProcessingTimeoutError) else "AUDIO_PROCESSING_ERROR"
-    return JSONResponse(
+    response = JSONResponse(
         status_code=status_code,
         content={
             "success": False,
@@ -1000,13 +1082,14 @@ async def audio_processing_error_handler(request: Request, exc: AudioProcessingE
             },
         },
     )
+    return add_cors_headers_to_response(response, request)
 
 @app.exception_handler(DependencyError)
 async def dependency_error_handler(request: Request, exc: DependencyError):
     """Handles errors when required libraries are not loaded."""
     request_id = getattr(request.state, 'request_id', None)
     logger.error(f"Dependency error for request {request.url} (ID: {request_id}): {exc}")
-    return JSONResponse(
+    response = JSONResponse(
         status_code=503,  # Service Unavailable
         content={
             "success": False,
@@ -1018,6 +1101,7 @@ async def dependency_error_handler(request: Request, exc: DependencyError):
             },
         },
     )
+    return add_cors_headers_to_response(response, request)
 # --- Dependency Injection & Validation Helpers ---
 
 def get_metrics_collector(request: Request) -> SimpleMetrics:
