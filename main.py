@@ -323,9 +323,10 @@ class Config(BaseSettings):
             "http://127.0.0.1:3000",
             # Vercel stable production domain
             "https://guitar-music-helper.vercel.app",
-            # Example preview domain (keep yours if you use it)
+            # Current Vercel preview domain
+            "https://guitar-music-helper-7g9fwzvch-dberzons-projects.vercel.app",
+            # Previous example domains (keep for compatibility)
             "https://guitar-music-helper-h7erfkcq4-dberzons-projects.vercel.app",
-            # Your deployed Vercel domain
             "https://guitar-music-helper-h9i35sgkq-dberzons-projects.vercel.app"
         ],
         description="List of allowed CORS origins"
